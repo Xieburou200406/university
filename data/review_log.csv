@@ -1,0 +1,2 @@
+date,panel_days,samples,hit_rate,baseline,edge,hit_rate_high_iv,hit_rate_low_iv,verdict
+2026-09-30 16:01,520,360,0.8083,0.5472,0.2611,0.8,0.8146,OK

@@ -25,7 +25,7 @@ from run_demo import (UNDERLYING, UNIT, R_FREE, HIST_DAYS, parse_symbol,
                       step3_live_quotes, log)
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
-M2_DAYS = 250
+M2_DAYS = 520          # ≈ 2 年交易日，重新验证类比引擎（v2 缓存增量补拉）
 WINDOW = 120
 HORIZON = 10
 
@@ -36,7 +36,7 @@ def fetch_dates(n_days):
     for attempt in range(3):
         try:
             hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
-                                       start_date="20250101", end_date="20991231", adjust="")
+                                       start_date="20240101", end_date="20991231", adjust="")
             break
         except Exception as e:
             log(f"  hist 第{attempt+1}次失败 {type(e).__name__}")
@@ -276,7 +276,7 @@ h1{{font-size:22px}} h2{{font-size:17px;border-left:4px solid #534AB7;padding-le
 .tbl th,.tbl td{{border-bottom:1px solid #e2e6ec;padding:5px 8px;text-align:right}}
 .tbl th:first-child,.tbl td:first-child{{text-align:left}}
 </style></head><body>
-<h1>M2 · 250 日历史 + SVI + 真实数据类比引擎</h1>
+<h1>M2 · {len(df)} 日历史 + SVI + 真实数据类比引擎</h1>
 <p>指标日 {ri_date} · 近月 {near_exp} · 历史区间 {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}（{len(df)} 个交易日，本地缓存 data/cache/）</p>
 
 <h2>1. 波动率曲线（SVI 主拟合）</h2>
@@ -291,7 +291,7 @@ h1{{font-size:22px}} h2{{font-size:17px;border-left:4px solid #534AB7;padding-le
 {('（' + str(sig_a['streak']) + ' 日连续处于高/低区，' + ('已确认' if sig_a.get('confirm_needed', 1) <= 0 else '还需 ' + str(sig_a['confirm_needed']) + ' 日确认') + '）') if sig_a.get('streak') is not None else ''}<br>
 {len(vs)} 日全样本 20/80 分位线见图中虚线。</div>
 
-<h2>3. 引擎 B · 历史情景类比（真实 250 日历史）</h2>
+<h2>3. 引擎 B · 历史情景类比（真实 {len(df)} 日历史）</h2>
 <div class="card">
 今日特征 = {sig_b.get('today_feat')}<br>
 选出策略 = <b>{sig_b.get('signal')}</b>（置信度 {sig_b.get('confidence')}）<br>

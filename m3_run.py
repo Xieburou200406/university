@@ -29,8 +29,8 @@ HOLD_DAYS = 20               # 归因演示：持仓 20 个交易日
 
 
 def load_panel():
-    """从缓存载入 250 日面板：date -> DataFrame(code, strike, cp, iv, delta, vega, theta...)"""
-    days = fetch_dates(250)
+    """从缓存载入 ~2 年面板：date -> DataFrame(code, strike, cp, iv, delta, vega, theta...)"""
+    days = fetch_dates(520)
     panel = {}
     for d, px in days:
         fp = os.path.join(CACHE_DIR, f"ri_v2_{d.replace('-', '')}.csv")
@@ -243,14 +243,25 @@ def replay_position(panel, df, open_offset=HOLD_DAYS):
 # ---------- 回测 ----------
 
 def backtest(df, pct_states, ana_states):
+    """
+    口径修正版回测：
+    - 状态滞后 1 日生效（T 日收盘出状态，T+1 才建仓赚 T+1 的涨跌），消灭日内前视；
+    - 类比引擎按预测持有期平滑：暴露 = 过去 HORIZON 日状态之和的符号，
+      避免预测未到期就被每日翻转（这正是方向命中率高却亏损的根源）。
+    """
     iv = df["iv_near"].tolist()
     n = len(iv)
     curves = {"percentile": [0.0], "analog": [0.0], "longvol": [0.0]}
     prev_exp = {"percentile": 0, "analog": 0}
     for i in range(1, n):
         div = (iv[i] - iv[i - 1]) / 0.01   # IV 点
-        e_pct = {"LONG_VOL": 1, "SHORT_VOL": -1}.get(pct_states[i], 0)
-        e_ana = ana_states[i]
+        # 分位数：昨日状态（消灭前视）
+        s_prev = pct_states[i - 1] if i >= 1 else "WARMUP"
+        e_pct = {"LONG_VOL": 1, "SHORT_VOL": -1}.get(s_prev, 0)
+        # 类比：过去 HORIZON 日状态平滑持有
+        lo = max(0, i - HORIZON)
+        s_sum = sum(ana_states[lo:i])
+        e_ana = 1 if s_sum > 0 else (-1 if s_sum < 0 else 0)
         for name, e, prev_e in [("percentile", e_pct, prev_exp["percentile"]),
                                 ("analog", e_ana, prev_exp["analog"])]:
             pnl = e * div * VEGA_NOTIONAL
