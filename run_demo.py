@@ -12,6 +12,7 @@ run_demo.py — 波动率决策辅助系统 端到端 Demo（M1 落地验证）
 import json
 import math
 import re
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -20,15 +21,17 @@ import numpy as np
 import pandas as pd
 import akshare as ak
 
-import pricing
-from signals import PercentileEngine, AnalogEngine, build_features, synthetic_history
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
+from vol.pricing.bs import implied_vol
+from vol.pricing.curve import fit_curve_iv
+from vol.pricing.liquidity import liquidity_score
+from vol.contracts import parse_sse_etf_code
+from vol.signals import PercentileEngine, AnalogEngine, build_features, synthetic_history
 
 UNDERLYING = "sh510050"
 UNIT = 10000          # 50ETF 期权合约单位
 HIST_DAYS = 60        # demo 拉 60 个交易日的官方风险指标
 R_FREE = 0.015
-
-SYMBOL_RE = re.compile(r"510050([CP])(\d{4})M(\d{5})")  # 510050C2610M02700
 
 
 def log(msg):
@@ -36,11 +39,8 @@ def log(msg):
 
 
 def parse_symbol(sym):
-    m = SYMBOL_RE.match(sym)
-    if not m:
-        return None
-    cp, exp, strike = m.group(1), m.group(2), int(m.group(3)) / 1000.0  # 02700 → 2.700 元
-    return {"cp": cp, "expiry": "20" + exp, "strike": strike}
+    # 注意：合约代码是裸的 510050 开头，不能传 UNDERLYING("sh510050"，sina 风格带前缀)
+    return parse_sse_etf_code(sym)
 
 
 # ---------- 第 1 步：标的与合约字典 ----------
@@ -224,7 +224,7 @@ def main():
     iv_self = []
     for _, r in near.iterrows():
         px = r["mid"] if not np.isnan(r["mid"]) else None
-        iv = pricing.implied_vol(px, spot_now, r["strike"], T, R_FREE, r["cp"]) if px else None
+        iv = implied_vol(px, spot_now, r["strike"], T, R_FREE, r["cp"]) if px else None
         iv_self.append(iv)
     near["iv_self"] = iv_self
 
@@ -233,7 +233,7 @@ def main():
              .groupby("strike", as_index=False)["iv_official"].mean()
              .sort_values("strike"))
     ks, ivs = valid["strike"].tolist(), valid["iv_official"].tolist()
-    curve_fn, r2, model_name = pricing.fit_curve_iv(ks, ivs, spot_now, T, R_FREE)
+    curve_fn, r2, model_name = fit_curve_iv(ks, ivs, spot_now, T, R_FREE)
     F = spot_now * math.exp(R_FREE * T)
     near["deviation_bp"] = near.apply(
         lambda r: round((r["iv_official"] - curve_fn(math.log(r["strike"] / F))) * 10000, 1)
@@ -243,7 +243,7 @@ def main():
     def rank(s):
         r = s.rank(pct=True).fillna(0)
         return r
-    near["liq"] = [pricing.liquidity_score(b, a, vr, orr) for b, a, vr, orr in
+    near["liq"] = [liquidity_score(b, a, vr, orr) for b, a, vr, orr in
                    zip(near["bid"], near["ask"], rank(near["volume"]), rank(near["oi"]))]
 
     # 历史 ATM IV → 分位数信号

@@ -12,12 +12,14 @@ import os
 import sqlite3
 
 import numpy as np
+import sys, os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backend"))
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import pricing
-from signals import AnalogEngine
+from vol.pricing.bs import bs_price
+from vol.signals import AnalogEngine
 from run_demo import R_FREE, log
 from m2_run import CACHE_DIR, WINDOW, HORIZON, fetch_dates, expiry_from_code
 
@@ -203,7 +205,7 @@ def replay_position(panel, df, open_offset=HOLD_DAYS):
             else:
                 row = row.iloc[0]
                 iv, dlt, vga, tht = float(row["iv"]), float(row["delta"]), float(row["vega"]), float(row["theta"])
-                price = pricing.bs_price(spot, leg["strike"], T, R_FREE, iv, leg["cp"])
+                price = bs_price(spot, leg["strike"], T, R_FREE, iv, leg["cp"])
             day_legs[leg["code"]] = {"price": price, "iv": iv, "delta": dlt, "vega": vga, "theta": tht}
             mv += leg["qty"] * price * UNIT
             acc_d += leg["qty"] * dlt * UNIT

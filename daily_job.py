@@ -11,9 +11,11 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 
+import sys, os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backend"))
 from m2_run import build_daily_history, WINDOW
 from run_demo import log
-from signals import PercentileEngine
+from vol.signals import PercentileEngine
 import pandas as pd
 import numpy as np
 

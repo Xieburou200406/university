@@ -13,12 +13,15 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import sys, os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backend"))
 
-import pricing
+
+from vol.pricing.curve import fit_curve_iv
 from run_demo import R_FREE, UNDERLYING, UNIT
 from m2_run import CACHE_DIR, WINDOW, HORIZON, load_day, build_daily_history, fetch_dates, expiry_from_code
 from m3_run import percentile_states, analog_states, backtest, replay_position, DB_PATH
-from signals import PercentileEngine
+from vol.signals import PercentileEngine
 
 st.set_page_config(page_title="波动率决策辅助系统", page_icon="📊", layout="wide")
 
@@ -89,7 +92,7 @@ def latest_curve(v):
 def _curve_meta():
     """拟合（毫秒级）放缓存外执行：SVI 闭包不可 pickle，不能进 cache_data。"""
     d, px, exp_str, T, F, agg, near = latest_curve(cache_version())
-    fn, r2, model = pricing.fit_curve_iv(agg["strike"].tolist(), agg["iv"].tolist(), px, T, R_FREE)
+    fn, r2, model = fit_curve_iv(agg["strike"].tolist(), agg["iv"].tolist(), px, T, R_FREE)
     near = near.copy()
     near["dev_bp"] = near.apply(
         lambda r: (r["iv"] - fn(math.log(r["strike"] / F))) * 10000 if r["iv"] > 0 else np.nan, axis=1)

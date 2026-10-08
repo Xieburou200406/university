@@ -50,3 +50,13 @@ def expiry_from_code(ym: str) -> date:
 
 def expiry_from_code_str(code: str) -> date:
     return parse_contract_code(code).expiry
+
+
+def parse_sse_etf_code(code: str, underlying: str = "510050"):
+    """数据层严格解析（与 demo 期 SYMBOL_RE 行为逐位一致）：必须含 M 标记，
+    不匹配返回 None。注意不加 $ 尾锚——真实代码含除权调整后缀（如尾缀 A），
+    旧解析按前缀匹配放行，这里必须保持一致，否则当日截面会整表解析失败。"""
+    m = re.match(rf"^{underlying}([CP])(\d{{4}})M(\d{{5}})", code)
+    if not m:
+        return None
+    return {"cp": m.group(1), "expiry": "20" + m.group(2), "strike": int(m.group(3)) / 1000.0}

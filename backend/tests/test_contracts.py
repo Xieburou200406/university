@@ -32,3 +32,11 @@ def test_tier_label():
 def test_invalid_code_raises():
     with pytest.raises(ValueError):
         parse_contract_code("NOT_A_CODE")
+
+
+def test_sse_etf_code_tolerant_suffix():
+    """数据层解析必须容忍尾部除权后缀（无 $ 尾锚）——加尾锚会让当日截面整表解析失败。"""
+    from vol.contracts import parse_sse_etf_code
+    assert parse_sse_etf_code("510050C2610M02700")["strike"] == 2.7
+    assert parse_sse_etf_code("510050C2610M02700A")["strike"] == 2.7
+    assert parse_sse_etf_code("510050C2610A02700") is None      # 无 M 标记 → 拒绝（与旧口径一致）

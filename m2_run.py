@@ -11,6 +11,7 @@ import json
 import re
 import math
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -18,8 +19,10 @@ import numpy as np
 import pandas as pd
 import akshare as ak
 
-import pricing
-from signals import PercentileEngine, AnalogEngine, build_features, FEATURES
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
+from vol.pricing.curve import fit_curve_iv
+from vol.contracts import expiry_from_code as _expiry_from_ym
+from vol.signals import PercentileEngine, AnalogEngine, build_features
 from run_demo import (UNDERLYING, UNIT, R_FREE, HIST_DAYS, parse_symbol,
                       step1_underlying_and_contracts, step2_risk_indicator,
                       step3_live_quotes, log)
@@ -78,14 +81,10 @@ def load_day(date_compact):
 
 
 def expiry_from_code(code):
-    """从合约代码推真实到期日：上交所 ETF 期权 = 到期月第 4 个周三。
-    code 例: 510050C2610M02700 → 2026-10 第4个周三。"""
+    """从合约代码推真实到期日：上交所 ETF 期权 = 到期月第 4 个周三（委托 vol.contracts）。"""
     try:
         m = re.match(r"510050[CP](\d{2})(\d{2})", code)
-        year, month = 2000 + int(m.group(1)), int(m.group(2))
-        first = datetime(year, month, 1)
-        offset = (2 - first.weekday()) % 7          # 周三 weekday=2
-        return pd.Timestamp(year, month, 1 + offset + 21)
+        return pd.Timestamp(_expiry_from_ym(f"20{m.group(1)}{m.group(2)}"))
     except Exception:
         return pd.NaT
 
@@ -162,7 +161,7 @@ def main():
     valid = (near[near["iv_official"] > 0]
              .groupby("strike", as_index=False)["iv_official"].mean()
              .sort_values("strike"))  # C/P 同行权价聚合，去噪声
-    curve_fn, r2, model_name = pricing.fit_curve_iv(
+    curve_fn, r2, model_name = fit_curve_iv(
         valid["strike"].tolist(), valid["iv_official"].tolist(), spot_now, T, R_FREE)
     F = spot_now * math.exp(R_FREE * T)
     near["deviation_bp"] = near.apply(
@@ -190,8 +189,8 @@ def main():
                   skew25=r.skew25)
              for r in feats_df.itertuples()]
     # 类比引擎特征维度扩展（skew25 加入）
-    import signals as S
-    S.FEATURES = FEATURES + ["skew25"]
+    import vol.signals.analog as S
+    S.FEATURES = S.FEATURES + ["skew25"]
     eng_b = AnalogEngine(k=25, horizon=HORIZON)
     sig_b = eng_b.run(feats, df["spot"].tolist(), df["iv_near"].tolist())
 
