@@ -1,0 +1,12 @@
+# 波动率系统配置（代码中的 Settings 默认值与此一致；改这里不改代码）
+window: 120
+confirm_days: 2
+k_nearest: 20
+horizon: 10
+vega_limit: 881.0
+delta_limit: 15000.0
+liq_min_score: 40
+fee_rate: 0.0002
+cache_version: v2
+cache_days: 520
+r_free: 0.02
