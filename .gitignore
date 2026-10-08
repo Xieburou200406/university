@@ -4,3 +4,5 @@ data/cache/
 vol_demo.db
 .venv/
 backend/static/
+data/vol.db*
+backend/db/migrations/__pycache__/

@@ -6,3 +6,5 @@ plotly>=5.20
 streamlit>=1.35
 pyyaml>=6.0
 pytest>=8.0
+sqlalchemy>=2.0
+alembic>=1.13
