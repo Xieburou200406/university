@@ -10,10 +10,16 @@ DEFAULT_DB = ROOT / "data" / "vol.db"
 
 
 def make_engine(url: str | None = None):
-    """创建引擎。SQLite 打开 WAL + 外键开关；测试可传 sqlite:///:memory: 或 tmp 路径。"""
-    url = url or f"sqlite:///{DEFAULT_DB}"
-    engine = create_engine(url, connect_args={"check_same_thread": False})
-    if url.startswith("sqlite"):
+    """创建引擎。SQLite 打开 WAL + 外键开关；测试可传 sqlite:///:memory: 或 tmp 路径。
+    内存库用 StaticPool：全进程共享同一连接（否则每线程各见一个空库）。"""
+    if url == "sqlite:///:memory:":
+        from sqlalchemy.pool import StaticPool
+        engine = create_engine(url, connect_args={"check_same_thread": False},
+                               poolclass=StaticPool)
+    else:
+        engine = create_engine(url or f"sqlite:///{DEFAULT_DB}",
+                               connect_args={"check_same_thread": False})
+    if engine.url.drivername.startswith("sqlite"):
         from sqlalchemy import event
 
         @event.listens_for(engine, "connect")
