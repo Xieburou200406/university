@@ -176,6 +176,55 @@ with tab2:
     sig = eng.run(df["iv_near"].tolist())
     pct_states, ana_states, _ = run_backtest(v, df)
 
+    # ---- §18.6 今日建议（滞留-采纳闭环）：T 收盘生成 → T+1 呈现 → 挂到采纳/忽略/过期 ----
+    try:
+        import sqlite3 as _sq
+        from datetime import date as _date
+        _con = _sq.connect(DB_PATH)
+        _today = _date.today().isoformat()
+        _stale = _con.execute(
+            """UPDATE advice_card SET status='expired'
+               WHERE status='pending' AND signal_id IN
+                 (SELECT id FROM signal WHERE valid_until < ?)""", (_today,))
+        _con.commit()
+        _row = _con.execute(
+            """SELECT a.id, s.date, s.engine, s.signal, s.valid_until, a.created_at
+               FROM advice_card a JOIN signal s ON a.signal_id = s.id
+               WHERE a.status='pending' AND s.valid_until >= ?
+               ORDER BY a.id DESC LIMIT 1""", (_today,)).fetchone()
+        if _stale.rowcount:
+            st.toast(f"已清算 {_stale.rowcount} 张过期未采纳的建议卡（留痕不删）")
+        _con.close()
+        if _row:
+            _aid, _sd, _eng_name, _sig_name, _vu, _ca = _row
+            with st.container(border=True):
+                cA, cB, cC = st.columns([3, 1, 1])
+                with cA:
+                    st.markdown(f"### 📌 今日建议（待采纳）—— {_sig_name} · {_eng_name} 引擎")
+                    st.caption(f"信号日 {_sd} 收盘生成 · 有效期至 {_vu}（T+1，铁律 8）· "
+                               f"生成于 {_ca} · 每日滞留呈现，直到采纳/忽略/过期")
+                with cB:
+                    if st.button("✅ 采纳", key=f"adopt_{_aid}", use_container_width=True):
+                        _c2 = _sq.connect(DB_PATH)
+                        _c2.execute("UPDATE advice_card SET status='adopted', adopted_at=CURRENT_TIMESTAMP "
+                                    "WHERE id=? AND status='pending'", (_aid,))
+                        _c2.commit(); _c2.close()
+                        st.success("已采纳（留痕：几点采纳）")
+                        st.rerun()
+                with cC:
+                    if st.button("✖️ 忽略", key=f"dismiss_{_aid}", use_container_width=True):
+                        _c3 = _sq.connect(DB_PATH)
+                        _c3.execute("UPDATE advice_card SET status='dismissed' "
+                                    "WHERE id=? AND status='pending'", (_aid,))
+                        _c3.commit(); _c3.close()
+                        st.info("已忽略本次建议")
+                        st.rerun()
+        else:
+            st.caption("今日无待采纳建议（已全部处理或尚无信号）")
+        st.divider()
+    except Exception:
+        pass  # 建议区故障不阻断信号台（fail-loud-not-crash）
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("引擎 A · IV 分位数")

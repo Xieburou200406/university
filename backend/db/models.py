@@ -43,13 +43,18 @@ class Signal(Base):
 
 
 class AdviceCard(Base):
-    """建议卡片存档（审计追溯）。"""
+    """建议卡片存档（审计追溯）。
+    生命周期（§18.6 滞留-采纳闭环）：pending 待采纳 → adopted 已采纳 / dismissed 已忽略；
+    有效期（signal.valid_until）内每次打开面板重复呈现（滞留），过期未处理自动标 expired（留痕不删）。"""
     __tablename__ = "advice_card"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     signal_id: Mapped[int] = mapped_column(ForeignKey("signal.id"), index=True)
     verdict_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 风控链 trace
     card_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending",
+                                        server_default="pending", index=True)
+    adopted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

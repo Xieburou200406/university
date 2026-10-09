@@ -2,7 +2,7 @@
 """业务服务层：①建议卡片生成（风控链 trace）②每日信号管线（复用 m2/m3 已迁移的领域包）。
 铁律 7：任何一步失败即 fail-closed（不出卡 / 管线标记 failed）。铁律 8：T+1 过期作废。"""
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -147,6 +147,61 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
 
 
 LAMBDA_MAP = {"conservative": 8.0, "balanced": 4.0, "aggressive": 2.0}   # §14.1 三档
+
+
+# ---- §18.6 建议生命周期：滞留-采纳闭环 ----
+# T 收盘后生成 pending 卡（语义：给 T+1）→ T+1 开盘前打开面板即"今日建议"再呈现
+# → 有效期内一直挂到 采纳/忽略，过期未处理由滞留清算自动标 expired（留痕不删）。
+
+def expire_stale_advice(session: Session, today: date) -> int:
+    """滞留清算：pending 卡对应的信号已过期（valid_until < today）→ 标 expired。留痕不删。"""
+    rows = session.execute(
+        select(AdviceCard).join(Signal, AdviceCard.signal_id == Signal.id)
+        .where(AdviceCard.status == "pending", Signal.valid_until < today)
+    ).scalars().all()
+    for c in rows:
+        c.status = "expired"
+    if rows:
+        session.commit()
+    return len(rows)
+
+
+def todays_advice(session: Session, today: date) -> AdviceCard | None:
+    """今日待采纳卡：最新一张 pending 且信号仍在有效期（滞留再呈现，直到采纳/忽略/过期）。"""
+    expire_stale_advice(session, today)
+    return session.execute(
+        select(AdviceCard).join(Signal, AdviceCard.signal_id == Signal.id)
+        .where(AdviceCard.status == "pending", Signal.valid_until >= today)
+        .order_by(AdviceCard.id.desc()).limit(1)
+    ).scalar_one_or_none()
+
+
+def adopt_advice(session: Session, card_id: int, today: date | None = None) -> AdviceCard:
+    """采纳建议（留痕：几点采纳）。过期卡不可采纳（铁律 8）。"""
+    ac = session.get(AdviceCard, card_id)
+    if ac is None:
+        raise LookupError(f"advice_card {card_id} 不存在")
+    if ac.status != "pending":
+        raise ValueError(f"卡片状态为 {ac.status}，不可采纳")
+    sig = session.get(Signal, ac.signal_id)
+    d = today or date.today()
+    if sig is None or sig.valid_until is None or sig.valid_until < d:
+        raise ValueError("信号已过期，不可采纳（T+1 有效，铁律 8）")
+    ac.status, ac.adopted_at = "adopted", datetime.now()
+    session.commit()
+    return ac
+
+
+def dismiss_advice(session: Session, card_id: int) -> AdviceCard:
+    """忽略建议（用户主动放弃本次参考）。"""
+    ac = session.get(AdviceCard, card_id)
+    if ac is None:
+        raise LookupError(f"advice_card {card_id} 不存在")
+    if ac.status != "pending":
+        raise ValueError(f"卡片状态为 {ac.status}，不可忽略")
+    ac.status = "dismissed"
+    session.commit()
+    return ac
 
 
 def _derive_forecast_features(df):

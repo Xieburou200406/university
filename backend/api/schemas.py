@@ -60,6 +60,8 @@ class AdviceCardOut(ORMModel):
     signal_id: int
     verdict_json: dict | None = None
     card_json: dict | None = None
+    status: str = "pending"            # pending / adopted / dismissed / expired（§18.6）
+    adopted_at: datetime | None = None
     created_at: datetime
 
 
