@@ -24,6 +24,7 @@ from run_demo import R_FREE, log
 from m2_run import CACHE_DIR, WINDOW, HORIZON, fetch_dates, expiry_from_code
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vol_demo.db")
+FORMAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vol.db")
 UNIT = 10000
 VEGA_NOTIONAL = 100.0        # 回测代理：每 1 个 IV 点（0.01）盈亏 100 元
 SWITCH_COST = 30.0           # 每次换向成本 ≈ 0.3 个 IV 点（价差+手续费代理）
@@ -239,7 +240,48 @@ def replay_position(panel, df, open_offset=HOLD_DAYS):
                     (r["date"], pid, None, r["mv"], r["cum"], r["delta"], r["vega"], r["theta"]))
     con.commit()
     con.close()
+    _sync_formal_ledger(d_open, K, exp_str, rows_ledger, df, legs[0]["iv_open"])   # M5-⑤：双写正式库
     return d_open, K, exp_str, rows_ledger, rows_attr
+
+
+def _sync_formal_ledger(d_open, K, exp_str, rows_ledger, df, open_px):
+    """双写正式库 data/vol.db（M5-⑤ 面板切正式库）。
+    列映射：market_value→mv、acc_delta→delta、acc_vega→vega；theta 存年化口径（铁律 2，
+    demo 库存每日口径）；iv/spot 从当日面板取（demo 快照无此两列，正式 schema NOT NULL）。
+    幂等：position 按 (code, open_date, status) 匹配复用，快照按 (date, position_id) upsert。
+    任何异常只告警，绝不影响 demo 库主流程（安全网）。"""
+    try:
+        if not os.path.exists(FORMAL_DB_PATH):
+            from db.models import Base
+            from db.session import make_engine
+            eng = make_engine()
+            Base.metadata.create_all(eng)
+            eng.dispose()
+        iv_map = dict(zip(df["date"], df["iv_near"]))
+        spot_map = dict(zip(df["date"], df["spot"]))
+        fcon = sqlite3.connect(FORMAL_DB_PATH)
+        fcur = fcon.cursor()
+        code = f"STRADDLE K={K} {exp_str}"
+        row = fcur.execute("SELECT id FROM position WHERE code=? AND open_date=? AND status='open'",
+                           (code, d_open)).fetchone()
+        if row is None:
+            fcur.execute("INSERT INTO position(code, qty, open_date, open_px, status) VALUES (?,?,?,?,?)",
+                         (code, -2, d_open, float(open_px), "OPEN"))
+            fpid = fcur.lastrowid
+        else:
+            fpid = row[0]
+        for r in rows_ledger:
+            fcur.execute("INSERT OR REPLACE INTO position_snapshot(date, position_id, mv, delta, vega, theta, iv, spot) "
+                         "VALUES (?,?,?,?,?,?,?,?)",
+                         (r["date"], fpid, r["mv"], r["delta"], r["vega"],
+                          r["theta"] * 365.0,               # 每日 → 年化（铁律 2）
+                          float(iv_map.get(r["date"]) or 0.0),
+                          float(spot_map.get(r["date"]) or 0.0)))
+        fcon.commit()
+        fcon.close()
+        log(f"正式库同步完成：{len(rows_ledger)} 条快照 → data/vol.db")
+    except Exception as e:                                  # noqa: BLE001 —— 安全网
+        log(f"正式库同步失败（不影响 demo 库）：{type(e).__name__}: {e}")
 
 
 # ---------- 回测 ----------

@@ -2,7 +2,7 @@
 """
 app.py — 波动率决策辅助系统 · Streamlit 面板（M4）
 五 Tab：IV监控 / 信号台 / 风控台 / 归因 / 回测
-数据全部读本地缓存（data/cache + vol_demo.db），"刷新数据"按钮触发显式联网。
+数据读本地缓存（data/cache）+ 正式库 data/vol.db（M5-⑤ 切换，demo 库 vol_demo.db 仅作回退），"刷新数据"按钮触发显式联网。
 启动：streamlit run app.py --server.port 8501
 """
 import math
@@ -20,7 +20,7 @@ sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "
 from vol.pricing.curve import fit_curve_iv
 from run_demo import R_FREE, UNDERLYING, UNIT
 from m2_run import CACHE_DIR, WINDOW, HORIZON, load_day, build_daily_history, fetch_dates, expiry_from_code
-from m3_run import percentile_states, analog_states, backtest, replay_position, DB_PATH
+from m3_run import percentile_states, analog_states, backtest, replay_position, FORMAL_DB_PATH as DB_PATH
 from vol.signals import PercentileEngine
 
 st.set_page_config(page_title="波动率决策辅助系统", page_icon="📊", layout="wide")
@@ -227,10 +227,10 @@ with tab3:
             c1, c2 = st.columns(2)
             vega_lim = st.sidebar.number_input("Vega 上限（元/1.0IV）", value=3000, key="vl")
             delta_lim = st.sidebar.number_input("Delta 上限（元）", value=15000, key="dl")
-            c1.metric("组合 Vega 敞口", f"{r['acc_vega']:+.0f}", f"上限 ±{vega_lim}")
-            c1.progress(min(abs(r['acc_vega']) / vega_lim, 1.0))
-            c2.metric("组合 Delta 敞口", f"{r['acc_delta']:+.0f}", f"上限 ±{delta_lim}")
-            c2.progress(min(abs(r['acc_delta']) / delta_lim, 1.0))
+            c1.metric("组合 Vega 敞口", f"{r['vega']:+.0f}", f"上限 ±{vega_lim}")
+            c1.progress(min(abs(r['vega']) / vega_lim, 1.0))
+            c2.metric("组合 Delta 敞口", f"{r['delta']:+.0f}", f"上限 ±{delta_lim}")
+            c2.progress(min(abs(r['delta']) / delta_lim, 1.0))
             st.caption(f"快照日 {r['date']} · fail-closed：参数未显式设置时一律拒绝开新仓")
         else:
             st.info("暂无持仓快照 —— 先在归因 Tab 生成示例持仓")
@@ -257,21 +257,23 @@ with tab4:
     if st.button("生成/刷新示例持仓回放（20 交易日，读本地缓存）"):
         replay_position({d: pd.read_csv(os.path.join(CACHE_DIR, f"ri_v2_{d.replace('-', '')}.csv"),
                                         dtype={"code": str})
-                         .assign(exp_dt=lambda x: pd.to_datetime(x["expiry"], format="%Y%m%d", errors="coerce"))
+                         .assign(exp_dt=lambda x: x["code"].map(expiry_from_code))
                          for d in df["date"]} | {}, df)
         st.cache_data.clear()
     try:
         snap = pd.read_sql_query("SELECT * FROM position_snapshot ORDER BY date", f"sqlite:///{DB_PATH}")
         pos = pd.read_sql_query("SELECT * FROM position LIMIT 1", f"sqlite:///{DB_PATH}")
         if len(snap):
-            st.success(f"持仓：{pos.iloc[0]['direction']} × {pos.iloc[0]['symbol']}（开仓 {pos.iloc[0]['open_date']}）")
+            _qty = int(pos.iloc[0]['qty'])
+            st.success(f"持仓：{'空头' if _qty < 0 else '多头'} × {abs(_qty)} 组 · {pos.iloc[0]['code']}（开仓 {pos.iloc[0]['open_date']}）")
+            cum_pnl = snap['mv'].diff().fillna(0).cumsum()   # 快照差分口径（铁律：展示必差分）
             c1, c2, c3 = st.columns(3)
-            c1.metric("累计盈亏", f"{snap['cum_pnl'].iloc[-1]:+.0f} 元")
-            c2.metric("累计 Vega", f"{snap['acc_vega'].iloc[-1]:+.0f}")
-            c3.metric("累计 Theta/天", f"{snap['acc_theta'].iloc[-1]:+.1f}")
-            diff = snap[["date", "market_value", "cum_pnl"]].diff()
-            st.line_chart(snap.set_index("date")[["cum_pnl"]], height=280)
-            st.caption("口径铁律：每日快照落库，展示必差分；残差（Gamma 等）占比 >30% 时黄牌")
+            c1.metric("累计盈亏（市值差分）", f"{cum_pnl.iloc[-1]:+.0f} 元")
+            c2.metric("组合 Vega", f"{snap['vega'].iloc[-1]:+.0f}")
+            c3.metric("Theta（年化口径）", f"{snap['theta'].iloc[-1]:+.0f}")
+            chart = snap.set_index("date")[["mv"]].assign(cum_pnl=cum_pnl)
+            st.line_chart(chart, height=280)
+            st.caption("正式库 data/vol.db · 口径铁律：每日快照落库，展示必差分；Theta 为年化口径（÷365=每日）")
         else:
             st.info("账本为空，点击上方按钮生成")
     except Exception as e:
