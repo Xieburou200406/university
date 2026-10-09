@@ -129,3 +129,40 @@ class ExecutionLog(Base):
     acted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     filled_px: Mapped[float | None] = mapped_column(Float, nullable=True)
     slippage_bp: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class OpenForecast(Base):
+    """隔夜开盘方向预测（§13.4）。abstain 是一等公民；brier_60d 质量自监控。"""
+    __tablename__ = "open_forecast"
+
+    date: Mapped[Date] = mapped_column(Date, primary_key=True)   # 预测发出日（T）
+    model_ver: Mapped[str] = mapped_column(String(16), default="lr-irls-v1")
+    p_up_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_up_cal: Mapped[float | None] = mapped_column(Float, nullable=True)
+    abstain: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    features_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    brier_60d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    morning_adj: Mapped[float | None] = mapped_column(Float, nullable=True)  # 9:25 竞价修正后的 P(up)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class RiskBudget(Base):
+    """今日最优风险预算（§14.4）。目标敞口为区间中心，区间宽度由置信度决定。"""
+    __tablename__ = "risk_budget"
+
+    date: Mapped[Date] = mapped_column(Date, primary_key=True)
+    lambda_level: Mapped[str] = mapped_column(String(8))          # conservative / balanced / aggressive
+    target_vega: Mapped[float] = mapped_column(Float)
+    target_vega_lo: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_vega_hi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_delta: Mapped[float] = mapped_column(Float)
+    target_delta_lo: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_delta_hi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cur_vega: Mapped[float] = mapped_column(Float)
+    cur_delta: Mapped[float] = mapped_column(Float)
+    cvar5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[str] = mapped_column(String(8), default="LOW")
+    degraded: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

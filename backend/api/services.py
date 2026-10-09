@@ -8,8 +8,8 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from db.models import (AdviceCard, DailyMetric, PipelineRun, Position,
-                       PositionSnapshot, Signal)
+from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
+                       Position, PositionSnapshot, RiskBudget, Signal)
 from vol.config import Settings
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -143,6 +143,125 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
     session.flush()
     return {"date": d_str, "percentile": pct["signal"], "analog": ana_sig,
             "agree": agree, "iv_now": round(iv_now, 4), "iv_pct_120": pct.get("iv_pct")}
+
+
+LAMBDA_MAP = {"conservative": 8.0, "balanced": 4.0, "aggressive": 2.0}   # §14.1 三档
+
+
+def _derive_forecast_features(df):
+    """从 m2 面板派生预测特征列（§13.2）。若面板已带完整特征列则原样返回。"""
+    import numpy as np
+    missing = [c for c in ("atm_iv", "iv_pct_120", "term_slope", "vrp", "momentum_20d") if c not in df.columns]
+    if not missing:
+        return df
+    df = df.copy()
+    df["atm_iv"] = df["iv_near"]
+    df["iv_pct_120"] = df["iv_near"].rolling(120).apply(lambda s: float((s <= s.iloc[-1]).mean()), raw=False)
+    df["term_slope"] = df["iv_near"] - df["iv_next"].fillna(df["iv_near"])
+    df["vrp"] = df["iv_near"] - df["rvol20"] if "rvol20" in df.columns else 0.0
+    df["momentum_20d"] = df["spot"].pct_change(20) if "spot" in df.columns else 0.0
+    df["skew25"] = df["skew25"].fillna(0.0) if "skew25" in df.columns else 0.0
+    return df
+
+
+def compute_and_store_forecast(session: Session, settings: Settings, df,
+                               open_map: dict | None = None) -> OpenForecast:
+    """§13 管线步：隔夜开盘方向预测 → upsert open_forecast。任何失败落 abstain 行（fail-closed）。"""
+    d = date.fromisoformat(str(df["date"].iloc[-1]))
+    try:
+        import numpy as np
+        if open_map:
+            df = df.assign(open=df["date"].map(open_map).astype(float))
+        else:
+            df = df.assign(open=np.nan)
+        df = _derive_forecast_features(df)
+        from vol.prediction.forecast import OpenDirectionForecaster
+        fc = OpenDirectionForecaster().forecast(df)
+        row = session.get(OpenForecast, d)
+        if row is None:
+            row = OpenForecast(date=d)
+            session.add(row)
+        row.model_ver, row.p_up_raw, row.p_up_cal = "lr-irls-v1", fc.p_up_raw, fc.p_up_cal
+        row.abstain, row.reason, row.features_json = fc.abstain, fc.reason, fc.coef
+        session.flush()
+        return row
+    except Exception as e:                          # noqa: BLE001 —— 预测失败不拖垮管线
+        row = session.get(OpenForecast, d)
+        if row is None:
+            row = OpenForecast(date=d)
+            session.add(row)
+        row.abstain, row.reason = True, f"预测管线异常（fail-closed）: {type(e).__name__}: {e}"[:500]
+        session.flush()
+        return row
+
+
+def compute_and_store_budget(session: Session, settings: Settings, df,
+                             lambda_level: str = "balanced") -> RiskBudget:
+    """§14 管线步：今日风险预算 → upsert risk_budget。失败落降级行（维持现仓位）。"""
+    d = date.fromisoformat(str(df["date"].iloc[-1]))
+    try:
+        from vol.riskbudget.optimize import solve_budget
+        from vol.riskbudget.scenarios import build_scenarios
+        pack = build_scenarios(df, k=settings.k_nearest, horizon=settings.horizon,
+                               window=settings.window)
+        _, cur_vega, cur_delta = latest_exposure(session)
+        theta_annual = _open_theta_annual(session)
+        res = solve_budget(cur_vega, cur_delta, theta_annual, pack,
+                           LAMBDA_MAP.get(lambda_level, 4.0),
+                           settings.vega_limit, settings.delta_limit,
+                           lambda_level, spot=float(df["spot"].iloc[-1]))
+        width = 0.25 * abs(res.target_vega) if not res.degraded else 0.0
+        width_d = 0.25 * abs(res.target_delta) if not res.degraded else 0.0
+        row = session.get(RiskBudget, d)
+        if row is None:
+            row = RiskBudget(date=d)
+            session.add(row)
+        row.lambda_level = lambda_level
+        row.target_vega, row.target_vega_lo, row.target_vega_hi = res.target_vega, res.target_vega - width, res.target_vega + width
+        row.target_delta, row.target_delta_lo, row.target_delta_hi = res.target_delta, res.target_delta - width_d, res.target_delta + width_d
+        row.cur_vega, row.cur_delta, row.cvar5 = cur_vega, cur_delta, res.cvar5
+        row.confidence, row.degraded = res.confidence, res.degraded
+        row.notes_json = {"reason": res.reason, "checks": res.checks, "state": [res.vega_state, res.delta_state]}
+        session.flush()
+        return row
+    except Exception as e:                          # noqa: BLE001 —— 预算失败落降级行
+        _, cur_vega, cur_delta = latest_exposure(session)
+        row = session.get(RiskBudget, d)
+        if row is None:
+            row = RiskBudget(date=d)
+            session.add(row)
+        row.lambda_level = lambda_level
+        row.target_vega = row.target_vega_lo = row.target_vega_hi = cur_vega
+        row.target_delta = row.target_delta_lo = row.target_delta_hi = cur_delta
+        row.cur_vega, row.cur_delta, row.cvar5 = cur_vega, cur_delta, None
+        row.confidence, row.degraded = "LOW", True
+        row.notes_json = {"reason": f"预算管线异常（fail-closed）: {type(e).__name__}: {e}"[:500]}
+        session.flush()
+        return row
+
+
+def _open_theta_annual(session: Session) -> float:
+    """最新快照日 open 持仓的年化 Theta（正式库 theta 列已是年化口径，铁律 2）。"""
+    latest = session.execute(select(func.max(PositionSnapshot.date))).scalar_one()
+    if latest is None:
+        return 0.0
+    open_ids = set(session.execute(
+        select(Position.id).where(Position.status == "open")).scalars().all())
+    rows = session.execute(select(PositionSnapshot).where(PositionSnapshot.date == latest)).scalars().all()
+    return float(sum(r.theta for r in rows if r.position_id in open_ids))
+
+
+def _fetch_open_map(days: int = 30) -> dict | None:
+    """T+1 开盘价映射（§13 标签/晨检复核）。联网失败返回 None → 预测自然弃权（fail-closed）。"""
+    try:
+        import akshare as ak
+        hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
+                                   start_date="20240101", end_date="20991231", adjust="")
+        hist["日期"] = hist["日期"].astype(str).str[:10]
+        tail = hist.tail(days)
+        return dict(zip(tail["日期"], tail["开盘"].astype(float)))
+    except Exception:
+        return None
 
 
 def trigger_pipeline(session: Session, fetch_df=None) -> PipelineRun:

@@ -46,7 +46,7 @@ def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "ok" and body["advice_only"] is True and body["tables"] == 9
+    assert body["status"] == "ok" and body["advice_only"] is True and body["tables"] == 11
 
 
 def test_metrics_list_and_detail(client):
@@ -194,4 +194,37 @@ def test_pipeline_reentry_lock_and_run(client, monkeypatch):
     assert {"percentile", "analog", "ensemble"} <= engines
     runs = client.get("/api/pipeline/runs").json()
     assert any(x["status"] == "ok" for x in runs)
+    s.close()
+
+
+def test_forecast_and_budget_endpoints(client):
+    """§13/§14 端点：无记录 → 404；种数据后 next-open / today 可读；晨检只写 morning_adj。"""
+    from db.models import OpenForecast, RiskBudget
+    Session = deps.init_engine()
+    s = Session()
+    r = client.get("/api/forecast/next-open")
+    assert r.status_code == 404
+    r = client.get("/api/riskbudget/today")
+    assert r.status_code == 404
+    s.add(OpenForecast(date=date(2026, 10, 8), model_ver="lr-irls-v1", p_up_raw=0.62,
+                       p_up_cal=0.63, abstain=False, reason="OK",
+                       features_json={"momentum_20d": 0.02}))
+    s.add(RiskBudget(date=date(2026, 10, 8), lambda_level="balanced", target_vega=-500.0,
+                     target_vega_lo=-625.0, target_vega_hi=-375.0, target_delta=0.0,
+                     cur_vega=-88.0, cur_delta=0.0, cvar5=-210.0, confidence="MID",
+                     degraded=False, notes_json={}))
+    s.commit()
+    r = client.get("/api/forecast/next-open")
+    assert r.status_code == 200 and r.json()["p_up_cal"] == pytest.approx(0.63)
+    r = client.get("/api/forecast/history")
+    assert r.status_code == 200 and len(r.json()) == 1
+    r = client.post("/api/forecast/morning-check/2026-10-08", json={"p_up_observed": 0.58})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["morning_adj"] == pytest.approx(0.58) and body["p_up_cal"] == pytest.approx(0.63)
+    assert client.post("/api/forecast/morning-check/2000-01-01", json={"p_up_observed": 0.5}).status_code == 404
+    r = client.get("/api/riskbudget/today")
+    assert r.status_code == 200
+    b = r.json()
+    assert b["target_vega"] == -500.0 and b["confidence"] == "MID" and b["degraded"] is False
     s.close()
