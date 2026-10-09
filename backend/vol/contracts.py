@@ -41,11 +41,10 @@ def parse_contract_code(code: str) -> ContractSpec:
 
 
 def expiry_from_code(ym: str) -> date:
-    """'202610' → 该月第 4 个周三（铁律 4：不依赖今日合约字典，历史退市合约也能算）。"""
-    y, mo = int(ym[:4]), int(ym[4:6])
-    first = date(y, mo, 1)
-    first_wed = 1 + (2 - first.weekday()) % 7   # weekday(): Mon=0 ... Wed=2
-    return date(y, mo, first_wed + 21)
+    """'202610' → 该月第 4 个周三（铁律 4：不依赖今日合约字典，历史退市合约也能算）。
+    实现单一来源：vol.calendar.exchange_rules.fourth_wednesday（§18 规则库）。"""
+    from vol.calendar.exchange_rules import fourth_wednesday
+    return fourth_wednesday(int(ym[:4]), int(ym[4:6]))
 
 
 def expiry_from_code_str(code: str) -> date:

@@ -2,7 +2,7 @@
 """业务服务层：①建议卡片生成（风控链 trace）②每日信号管线（复用 m2/m3 已迁移的领域包）。
 铁律 7：任何一步失败即 fail-closed（不出卡 / 管线标记 failed）。铁律 8：T+1 过期作废。"""
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
                        Position, PositionSnapshot, RiskBudget, Signal)
+from vol.calendar import get_calendar
 from vol.config import Settings
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -21,8 +22,8 @@ _ACTION = {"SHORT_VOL": "倾向卖波（收权利金方向）", "LONG_VOL": "倾
 
 
 def _exec_window(d: date) -> str:
-    """T+1 执行窗口提示（铁律 8）。正式交易日历接入前按下一自然日。"""
-    return f"{d + timedelta(days=1)} 9:35~10:00"
+    """T+1 执行窗口提示（铁律 8）：下一交易日的 9:35~10:00（§18 交易日历）。"""
+    return get_calendar().exec_window(d)
 
 
 def latest_exposure(session: Session) -> tuple[date | None, float, float]:
@@ -127,16 +128,16 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
 
     # 信号落库（百分位 + 类比各自一条；ensemble 结论并入 detail）
     rows = [Signal(date=d, engine="percentile", signal=pct["signal"],
-                   confidence=None, valid_until=d + timedelta(days=1), detail_json=pct)]
+                   confidence=None, valid_until=get_calendar().next_trading_day(d), detail_json=pct)]
     ana_sig = {1: "LONG_VOL", -1: "SHORT_VOL", 0: "NEUTRAL"}[int(ana_last)]
     rows.append(Signal(date=d, engine="analog", signal=ana_sig, confidence=None,
-                       valid_until=d + timedelta(days=1),
+                       valid_until=get_calendar().next_trading_day(d),
                        detail_json={"k": settings.k_nearest, "horizon": settings.horizon}))
     agree = (pct["signal"] == ana_sig and pct["signal"] in ("LONG_VOL", "SHORT_VOL"))
     rows.append(Signal(date=d, engine="ensemble",
                        signal=pct["signal"] if pct["signal"] in ("LONG_VOL", "SHORT_VOL", "NEUTRAL") else "NEUTRAL",
                        confidence=0.75 if agree else 0.4,
-                       valid_until=d + timedelta(days=1),
+                       valid_until=get_calendar().next_trading_day(d),
                        detail_json={"analog": ana_sig, "agreed": agree,
                                     "note": "同向增强；不一致则降级参考"}))
     session.add_all(rows)

@@ -18,6 +18,7 @@ sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "
 
 
 from vol.pricing.curve import fit_curve_iv
+from vol.calendar import get_calendar
 from run_demo import R_FREE, UNDERLYING, UNIT
 from m2_run import CACHE_DIR, WINDOW, HORIZON, load_day, build_daily_history, fetch_dates, expiry_from_code
 from m3_run import percentile_states, analog_states, backtest, replay_position, FORMAL_DB_PATH as DB_PATH
@@ -122,6 +123,8 @@ v = cache_version()
 df = load_df(v)
 st.sidebar.metric("本地历史", f"{len(df)} 交易日")
 st.sidebar.caption(f"{df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
+cal = get_calendar()
+st.sidebar.caption(cal.status_label())
 st.sidebar.caption("铁律：只输出建议，永不自动下单；\n信号 T 日生成、T+1 执行窗口内有效。")
 
 if st.sidebar.button("刷新数据（显式联网，约 30 秒）"):
@@ -136,9 +139,12 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 IV 监控", "🎯 信号台", "�
 
 with tab1:
     d, px, exp_str, T, F, fn, r2, model, near = _curve_meta()
+    _exp_dt = pd.Timestamp(exp_str).date()
+    _d_dt = pd.Timestamp(d).date()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("510050 现价", f"{px:.3f}")
-    c2.metric("近月到期", exp_str, f"T-{(pd.Timestamp(exp_str) - pd.Timestamp(d)).days} 天")
+    c2.metric("近月到期", exp_str,
+              f"T-{cal.countdown(_d_dt, _exp_dt)} 个交易日（下一交易日 {cal.next_trading_day(_d_dt)}）")
     c3.metric("ATM IV", f"{df['iv_near'].iloc[-1] * 100:.2f}%")
     c4.metric("曲线拟合", f"{model} R²={r2:.3f}")
 

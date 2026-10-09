@@ -9,7 +9,7 @@ daily_job.py — 每日定时任务（M4）
 """
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import sys, os as _os
 sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backend"))
@@ -23,14 +23,22 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vol_demo.db"
 
 
 def next_trading_day_like_exec_window(today):
-    """T+1 执行窗口提示（简单取下一自然日，正式版用交易日历）。"""
-    return (today + timedelta(days=1)).strftime("%Y-%m-%d") + " 9:35~10:00"
+    """T+1 执行窗口提示：下一交易日的 9:35~10:00（§18 交易日历，周五信号→周一窗口）。"""
+    from vol.calendar import get_calendar
+    return get_calendar().exec_window(today)
 
 
 def main():
     log("===== 每日任务开始 =====")
     df = build_daily_history()
     log(f"历史面板 {len(df)} 日（{df['date'].iloc[0]} ~ {df['date'].iloc[-1]}）")
+
+    # 显式联网窗口顺便刷新官方交易日历（§18；失败仅降级不阻断）
+    from vol.calendar import refresh_calendar_cache
+    if refresh_calendar_cache():
+        log("官方交易日历已刷新（data/cache/trade_dates.csv）")
+    else:
+        log("交易日历刷新失败，按降级链兜底（周末规则/面板缓存）")
 
     eng = PercentileEngine(window=WINDOW)
     sig = eng.run(df["iv_near"].tolist())
