@@ -2,7 +2,7 @@
 """§18.6 建议生命周期：滞留-采纳闭环。
 T 收盘生成 pending 卡 → T+1 有效期内滞留再呈现（/advice/today）
 → 采纳（留痕）/忽略；过期未处理自动清算为 expired（留痕不删）。"""
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,7 +57,7 @@ def _seed_card(s, sig, status="pending"):
 # ---- 有效期内：滞留再呈现 + 采纳留痕 ----
 
 def test_today_returns_pending_card_within_validity(client, session):
-    sig = _seed_signal(session, date(2026, 10, 12))          # 周一有效
+    sig = _seed_signal(session, date.today() + timedelta(days=1))  # 未过期（相对今日，防日期炸弹）
     _seed_card(session, sig)
     r = client.get("/api/advice/today")
     assert r.status_code == 200
@@ -68,7 +68,7 @@ def test_today_returns_pending_card_within_validity(client, session):
 
 
 def test_adopt_records_timestamp_then_stops_presenting(client, session):
-    sig = _seed_signal(session, date(2026, 10, 12))
+    sig = _seed_signal(session, date.today() + timedelta(days=1))
     ac = _seed_card(session, sig)
     r = client.post(f"/api/advice/{ac.id}/adopt")
     assert r.status_code == 200
@@ -81,7 +81,7 @@ def test_adopt_records_timestamp_then_stops_presenting(client, session):
 
 
 def test_dismiss_stops_presenting(client, session):
-    sig = _seed_signal(session, date(2026, 10, 12))
+    sig = _seed_signal(session, date.today() + timedelta(days=1))
     ac = _seed_card(session, sig)
     assert client.post(f"/api/advice/{ac.id}/dismiss").status_code == 200
     assert client.get("/api/advice/today").json()["card"] is None
@@ -107,7 +107,7 @@ def test_adopt_nonexistent_card_404(client, session):
 
 def test_newest_pending_card_wins(client, session):
     """两张 pending：今日呈现最新一张（id 大者）。"""
-    sig = _seed_signal(session, date(2026, 10, 12))
+    sig = _seed_signal(session, date.today() + timedelta(days=1))
     old = _seed_card(session, sig)
     new = _seed_card(session, sig)
     assert client.get("/api/advice/today").json()["card"]["id"] == new.id

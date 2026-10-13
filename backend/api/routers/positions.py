@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_db
 from api.schemas import PositionClose, PositionCreate, PositionOut, PositionSnapshotOut
+from api.services import position_risk_review
 from db.models import Position, PositionSnapshot
 
 
@@ -41,6 +42,11 @@ def router() -> APIRouter:
         pos.close_date, pos.close_px, pos.status = body.close_date, body.close_px, "closed"
         db.flush()
         return pos
+
+    @r.get("/positions/risk-review")
+    def risk_review(db: Session = Depends(get_db), asof: date | None = None):
+        """持仓风险评审（§20.2 P1）：保证金估算上界 + 浮亏分级 + 到期周提醒。"""
+        return position_risk_review(db, asof)
 
     @r.get("/positions/{pid}/snapshots", response_model=list[PositionSnapshotOut])
     def snapshots(pid: int, db: Session = Depends(get_db),

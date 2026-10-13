@@ -34,8 +34,11 @@ def _make_memory_engine():
 def _seed_basic(session):
     session.add(DailyMetric(date=date(2026, 10, 7), spot=2.70, atm_iv=0.27, iv_pct_120=0.52))
     session.add(DailyMetric(date=date(2026, 10, 8), spot=2.71, atm_iv=0.273, iv_pct_120=0.542))
-    sig = Signal(date=date(2026, 10, 8), engine="percentile", signal="SHORT_VOL",
-                 confidence=0.9, valid_until=date(2026, 10, 9),
+    # 信号日期相对"今天"生成（防日期炸弹：写死日期会在铁律 8 下随时间自然过期）
+    from vol.calendar import get_calendar
+    _tdy = date.today()
+    sig = Signal(date=_tdy, engine="percentile", signal="SHORT_VOL",
+                 confidence=0.9, valid_until=get_calendar().next_trading_day(_tdy),
                  detail_json={"iv_pct": 0.542, "confirm_needed": 0})
     session.add(sig)
     session.flush()
@@ -88,7 +91,7 @@ def test_advice_generate_pass(client):
     assert r.status_code == 200
     body = r.json()
     assert body["verdict"] == "PASS"                    # 无持仓 → 敞口为 0，风控全过
-    assert {c["name"] for c in body["risk_checks"]} == {"signal_valid_until", "vega_limit", "delta_limit"}
+    assert {c["name"] for c in body["risk_checks"]} == {"signal_valid_until", "vega_limit", "delta_limit", "floating_loss"}
     assert "不自动下单" in body["card"]["card_json"]["disclaimer"]
     s.close()
 

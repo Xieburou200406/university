@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
                        Position, PositionSnapshot, RiskBudget, Signal)
+from vol import position_risk as pr
 from vol.calendar import get_calendar
 from vol.config import Settings
 
@@ -33,10 +34,56 @@ def latest_exposure(session: Session) -> tuple[date | None, float, float]:
         return None, 0.0, 0.0
     rows = session.execute(select(PositionSnapshot).where(PositionSnapshot.date == latest)).scalars().all()
     open_ids = set(session.execute(
-        select(Position.id).where(Position.status == "open")).scalars().all())
+        select(Position.id).where(func.upper(Position.status) == "OPEN")).scalars().all())
     vega = sum(r.vega for r in rows if r.position_id in open_ids)
     delta = sum(r.delta for r in rows if r.position_id in open_ids)
     return latest, vega, delta
+
+
+def position_risk_review(session: Session, asof: date | None = None) -> dict:
+    """持仓风险评审（§20.2 P1）：保证金占用估算 + 浮亏触发线 + 到期周提醒。
+    纯聚合：只读 Position × PositionSnapshot，算术全部委托 vol.position_risk 纯函数。
+    快照取 asof（默认最新快照日）；某持仓当日无快照则跳过（fail-soft，不虚构估值）。"""
+    cal = get_calendar()
+    if asof is None:
+        asof = session.execute(select(func.max(PositionSnapshot.date))).scalar_one()
+    if asof is None:
+        return {"asof": None, "rows": [], "total_margin_est": 0.0,
+                "max_loss_level": None, "expiry_week": []}
+
+    snaps = {s.position_id: s for s in session.execute(
+        select(PositionSnapshot).where(PositionSnapshot.date == asof)).scalars().all()}
+    positions = session.execute(
+        select(Position).where(func.upper(Position.status) == "OPEN")).scalars().all()
+
+    rows: list[dict] = []
+    for p in positions:
+        s = snaps.get(p.id)
+        if s is None:
+            continue
+        qty = int(p.qty)
+        cur_px = abs(s.mv) / (abs(qty) * pr.UNIT) if qty else 0.0
+        ratio, level = pr.loss_level(s.mv, qty, p.open_px)
+        margin = pr.estimate_margin_short(cur_px, s.spot) * abs(qty) if qty < 0 else 0.0
+        exp = pr.parse_expiry(p.code)
+        td_left = cal.countdown(asof, exp) if exp else None
+        rows.append({
+            "code": p.code, "qty": qty, "open_px": p.open_px, "cur_px": round(cur_px, 4),
+            "unrealized_pnl": round(pr.unrealized_pnl(s.mv, qty, p.open_px), 2),
+            "loss_ratio": round(ratio, 4), "loss_level": level,
+            "margin_est": round(margin, 2),
+            "expiry": str(exp) if exp else None,
+            "trading_days_left": td_left,
+            "expiry_week": td_left is not None and td_left <= pr.EXPIRY_WEEK_DAYS,
+        })
+
+    levels = [r["loss_level"] for r in rows if r["loss_level"]]
+    return {
+        "asof": str(asof), "rows": rows,
+        "total_margin_est": round(sum(r["margin_est"] for r in rows), 2),
+        "max_loss_level": "STRONG" if "STRONG" in levels else ("WARN" if "WARN" in levels else None),
+        "expiry_week": [r["code"] for r in rows if r["expiry_week"]],
+    }
 
 
 def generate_advice(session: Session, settings: Settings, signal_id: int) -> AdviceCard:
@@ -64,8 +111,16 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
     checks.append({"name": "delta_limit", "passed": delta_ok,
                    "detail": f"组合delta={delta:.1f}, 限额±{settings.delta_limit}"})
 
+    # ④ 持仓风险评审（§20.2 P1）：浮亏触发线 + 到期周 + 保证金占用
+    review = position_risk_review(session)
+    loss_ok = review["max_loss_level"] != "STRONG"
+    checks.append({"name": "floating_loss", "passed": loss_ok,
+                   "detail": (f"最差浮亏等级={review['max_loss_level'] or '正常'}"
+                              f"（阈值：≥50% WARN / ≥100% STRONG，权利金口径）")})
+    expiry_week = review["expiry_week"]
+
     hard_fail = not valid
-    soft_warn = not (vega_ok and delta_ok)
+    soft_warn = not (vega_ok and delta_ok and loss_ok)
     verdict = "REJECT" if hard_fail else ("WARN" if soft_warn else "PASS")
 
     action = _ACTION.get(sig.signal, "观望")
@@ -75,12 +130,17 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
         action = "已过期，执行前必须基于最新信号重新生成建议"
     if verdict == "WARN":
         action += "；⚠️ 组合敞口接近/超出限额，先减仓再考虑新头寸"
+    if not loss_ok:
+        action += "；🚨 现有持仓浮亏已达权利金 100%，行业惯例优先处理亏损头寸而非加新仓"
+    if expiry_week:
+        action += f"；⏳ 到期周提醒（剩≤5个交易日：{'、'.join(expiry_week)}）——注意 pin risk 与行权指派，行业惯例提前移仓"
 
     card = {
         "date": str(sig.date), "signal": sig.signal, "action": action,
         "engine": sig.engine, "confidence": sig.confidence,
         "valid_until": str(sig.valid_until) if sig.valid_until else None,
         "exec_window": _exec_window(sig.date),
+        "position_risk": review,
         "disclaimer": "本系统只生成建议，不自动下单；执行前必须用 T+1 最新行情复核风控条件链",
     }
     ac = AdviceCard(signal_id=sig.id, verdict_json={"verdict": verdict, "checks": checks},
@@ -302,7 +362,7 @@ def _open_theta_annual(session: Session) -> float:
     if latest is None:
         return 0.0
     open_ids = set(session.execute(
-        select(Position.id).where(Position.status == "open")).scalars().all())
+        select(Position.id).where(func.upper(Position.status) == "OPEN")).scalars().all())
     rows = session.execute(select(PositionSnapshot).where(PositionSnapshot.date == latest)).scalars().all()
     return float(sum(r.theta for r in rows if r.position_id in open_ids))
 

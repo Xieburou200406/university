@@ -30,6 +30,36 @@ SWITCH_COST = 30.0
 VEGA_NOTIONAL = 100.0
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _position_review(db_path):
+    """持仓风险评审（§20.2 P1）：保证金上界 + 浮亏分级 + 到期周。
+    算术全部委托 vol.position_risk 纯函数（与 services.position_risk_review 同源）。"""
+    import sqlite3 as _sq
+    from datetime import date as _d2
+    from vol import position_risk as pr
+    cal = get_calendar()
+    con = _sq.connect(db_path)
+    try:
+        rows = []
+        for pid, code, qty, open_px in con.execute(
+                "SELECT id, code, qty, open_px FROM position WHERE upper(status)='OPEN'").fetchall():
+            r = con.execute("SELECT date, mv, spot FROM position_snapshot WHERE position_id=? "
+                            "ORDER BY date DESC LIMIT 1", (pid,)).fetchone()
+            if not r:
+                continue
+            d, mv, spot = r
+            ratio, level = pr.loss_level(mv, qty, open_px)
+            cur_px = abs(mv) / (abs(qty) * pr.UNIT) if qty else 0.0
+            margin = pr.estimate_margin_short(cur_px, spot) * abs(qty) if qty < 0 else 0.0
+            exp = pr.parse_expiry(code)
+            td = cal.countdown(_d2.fromisoformat(d), exp) if exp else None
+            rows.append({"code": code, "ratio": ratio, "level": level,
+                         "margin": margin, "td": td, "exp": str(exp) if exp else None})
+        return rows
+    finally:
+        con.close()
+
+
 def cache_version():
     fps = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR)] if os.path.isdir(CACHE_DIR) else []
     return max((os.path.getmtime(f) for f in fps), default=0.0)
@@ -203,6 +233,24 @@ with tab2:
                     st.markdown(f"### 📌 今日建议（待采纳）—— {_sig_name} · {_eng_name} 引擎")
                     st.caption(f"信号日 {_sd} 收盘生成 · 有效期至 {_vu}（T+1，铁律 8）· "
                                f"生成于 {_ca} · 每日滞留呈现，直到采纳/忽略/过期")
+                    # §20.2 P1 角标：保证金上界 / 浮亏分级 / 到期周（机器算好，扫一眼）
+                    _rv = _position_review(DB_PATH)
+                    if _rv:
+                        _badges = []
+                        _mm = sum(r["margin"] for r in _rv)
+                        if _mm:
+                            _badges.append(f"💰 保证金占用估算（上界）≈ {_mm:,.0f} 元")
+                        _worst = max((r["level"] for r in _rv),
+                                     key=lambda x: {"STRONG": 2, "WARN": 1}.get(x, 0), default=None)
+                        if _worst == "STRONG":
+                            _badges.append("🚨 浮亏 ≥100% 应收权利金")
+                        elif _worst == "WARN":
+                            _badges.append("⚠️ 浮亏 ≥50% 应收权利金")
+                        _ew = [f"T-{r['td']}" for r in _rv if r["td"] is not None and r["td"] <= 5]
+                        if _ew:
+                            _badges.append(f"⏳ 到期周（剩 {'、'.join(_ew)} 个交易日）")
+                        if _badges:
+                            (_st.error if _worst == "STRONG" else _st.warning)(" · ".join(_badges))
                 with cB:
                     if st.button("✅ 采纳", key=f"adopt_{_aid}", use_container_width=True):
                         _c2 = _sq.connect(DB_PATH)
@@ -326,6 +374,17 @@ with tab4:
             c1.metric("累计盈亏（市值差分）", f"{cum_pnl.iloc[-1]:+.0f} 元")
             c2.metric("组合 Vega", f"{snap['vega'].iloc[-1]:+.0f}")
             c3.metric("Theta（年化口径）", f"{snap['theta'].iloc[-1]:+.0f}")
+            # §20.2 P1：保证金占用 / 浮亏触发线 / 到期周
+            _rv = _position_review(DB_PATH)
+            if _rv:
+                _r = _rv[0]
+                _lvl = {"STRONG": "🚨 STRONG（≥100% 权利金）", "WARN": "⚠️ WARN（≥50% 权利金）"}.get(_r["level"], "正常")
+                d1, d2, d3 = st.columns(3)
+                d1.metric("保证金占用（估算上界）", f"{_r['margin']:,.0f} 元",
+                          help="上交所最低标准公式：[px + Max(12%·px, 10%·spot)]×10000；不扣虚值 → 上界偏保守")
+                d2.metric("浮亏 / 应收权利金", f"{_r['ratio']*100:.0f}%", _lvl)
+                d3.metric("到期倒计时", f"T-{_r['td']} 个交易日" if _r["td"] is not None else "未知",
+                          "⏳ 到期周：注意 pin risk/指派" if (_r["td"] is not None and _r["td"] <= 5) else _r["exp"])
             chart = snap.set_index("date")[["mv"]].assign(cum_pnl=cum_pnl)
             st.line_chart(chart, height=280)
             st.caption("正式库 data/vol.db · 口径铁律：每日快照落库，展示必差分；Theta 为年化口径（÷365=每日）")
