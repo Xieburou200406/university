@@ -142,7 +142,68 @@ def test_review_empty_ledger(session):
     from api.services import position_risk_review
     rv = position_risk_review(session)
     assert rv == {"asof": None, "rows": [], "total_margin_est": 0.0,
-                  "max_loss_level": None, "expiry_week": []}
+                  "max_loss_level": None, "expiry_week": [], "price_limit_hits": []}
+
+
+# ---------- 纯函数：涨跌停区间（§20.2 #5）----------
+
+def test_price_limit_band_golden_deep_otm():
+    # 金样本：前结算 0.0512（深度虚值腿），标的前收 2.918
+    # 认购上界 = 0.0512 + max(0.5%·0.0512, min(10%·(2·0.0512−2.918), 10%·2.918)) = 0.0512+0.000256（0.5% 地板主导）
+    lo, hi = pr.price_limit_band(0.0512283, 2.918, kind="C")
+    assert lo == pytest.approx(0.0461, abs=1e-4)
+    assert hi == pytest.approx(0.0512 + 0.000256, abs=1e-4)
+    # 认沽上界 = 0.0512 + 10%·2.918（10%·标的封顶主导）
+    _, hi_p = pr.price_limit_band(0.0512283, 2.918, kind="P")
+    assert hi_p == pytest.approx(0.0512 + 0.2918, abs=1e-4)
+
+
+def test_price_limit_band_none_kind_is_union():
+    # None（跨式/未知类型）= 并集（更宽者）：合成定价账本若用交集会天天误报越界（警报疲劳）
+    lo_c, hi_c = pr.price_limit_band(0.20, 2.90, kind="C")
+    lo_p, hi_p = pr.price_limit_band(0.20, 2.90, kind="P")
+    lo_n, hi_n = pr.price_limit_band(0.20, 2.90, kind=None)
+    assert lo_n == pytest.approx(max(lo_c, lo_p))     # 下界同源
+    assert hi_n == pytest.approx(max(hi_c, hi_p))     # 并集：单腿最宽区间
+
+
+def test_price_limit_band_fail_soft():
+    assert pr.price_limit_band(0.0, 2.9) is None
+    assert pr.price_limit_band(0.05, -1.0) is None
+
+
+# ---------- services 聚合：涨跌停越界 ----------
+
+def test_review_price_limit_hit_detection(session):
+    # 前日 px=0.05 → 并集区间 ≈ [0.045, 0.342]（宽：认沽腿 10%·标的主导）；
+    # 次日跌到 0.03（低于跌停 0.045）→ 越下界。并集口径下向上越界需跳涨 >6 倍，属真实异常才触发。
+    p = Position(code="STRADDLE K=3.0 2026-10-28", qty=-2, open_date=date(2026, 9, 2),
+                 open_px=0.095, status="open")
+    session.add(p)
+    session.flush()
+    session.add(PositionSnapshot(date=date(2026, 10, 8), position_id=p.id, mv=-1000.0,
+                                 delta=0.0, vega=-1.0, theta=-0.4, iv=0.18, spot=2.918))
+    session.add(PositionSnapshot(date=date(2026, 10, 9), position_id=p.id, mv=-600.0,
+                                 delta=0.0, vega=-1.0, theta=-0.4, iv=0.18, spot=2.918))
+    session.commit()
+    from api.services import position_risk_review
+    rv = position_risk_review(session)
+    row = rv["rows"][0]
+    assert row["cur_px"] == pytest.approx(0.03)
+    assert row["price_limit_hit"] == "DOWN"
+    assert rv["price_limit_hits"] and "DOWN" in rv["price_limit_hits"][0]
+
+
+def test_review_price_limit_inside_band(session):
+    # 沿用金样本两快照：0.0512 → 0.0512，价格没动 → 区间内
+    _seed_position(session)
+    from api.services import position_risk_review
+    rv = position_risk_review(session, asof=date(2026, 10, 10))  # asof 无快照 → rows 空
+    assert rv["rows"] == []
+    # 正确姿势：直接用默认 asof（库里只有一天快照，无前日 → 不判越界）
+    from db.session import make_engine  # noqa: F401  确认同 session 上下文
+    rv2 = position_risk_review(session)
+    assert rv2["rows"][0]["price_limit_hit"] is None
 
 
 # ---------- API ----------

@@ -91,7 +91,7 @@ def test_advice_generate_pass(client):
     assert r.status_code == 200
     body = r.json()
     assert body["verdict"] == "PASS"                    # 无持仓 → 敞口为 0，风控全过
-    assert {c["name"] for c in body["risk_checks"]} == {"signal_valid_until", "vega_limit", "delta_limit", "floating_loss"}
+    assert {c["name"] for c in body["risk_checks"]} == {"signal_valid_until", "vega_limit", "delta_limit", "floating_loss", "price_limit"}
     assert "不自动下单" in body["card"]["card_json"]["disclaimer"]
     s.close()
 

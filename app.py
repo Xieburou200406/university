@@ -43,18 +43,25 @@ def _position_review(db_path):
         rows = []
         for pid, code, qty, open_px in con.execute(
                 "SELECT id, code, qty, open_px FROM position WHERE upper(status)='OPEN'").fetchall():
-            r = con.execute("SELECT date, mv, spot FROM position_snapshot WHERE position_id=? "
-                            "ORDER BY date DESC LIMIT 1", (pid,)).fetchone()
-            if not r:
+            r2 = con.execute("SELECT date, mv, spot FROM position_snapshot WHERE position_id=? "
+                             "ORDER BY date DESC LIMIT 2", (pid,)).fetchall()
+            if not r2:
                 continue
-            d, mv, spot = r
+            d, mv, spot = r2[0]
             ratio, level = pr.loss_level(mv, qty, open_px)
             cur_px = abs(mv) / (abs(qty) * pr.UNIT) if qty else 0.0
             margin = pr.estimate_margin_short(cur_px, spot) * abs(qty) if qty < 0 else 0.0
             exp = pr.parse_expiry(code)
             td = cal.countdown(_d2.fromisoformat(d), exp) if exp else None
-            rows.append({"code": code, "ratio": ratio, "level": level,
-                         "margin": margin, "td": td, "exp": str(exp) if exp else None})
+            # §20.2 #5：前一日快照作前结算代理，校验今日价是否越涨跌停区间
+            hit = None
+            if len(r2) == 2 and abs(qty) > 0:
+                prev_px = abs(r2[1][1]) / (abs(qty) * pr.UNIT)
+                band = pr.price_limit_band(prev_px, r2[1][2])
+                if band and not (band[0] <= cur_px <= band[1]):
+                    hit = "UP" if cur_px > band[1] else "DOWN"
+            rows.append({"code": code, "ratio": ratio, "level": level, "margin": margin,
+                         "td": td, "exp": str(exp) if exp else None, "limit_hit": hit})
         return rows
     finally:
         con.close()
@@ -249,6 +256,9 @@ with tab2:
                         _ew = [f"T-{r['td']}" for r in _rv if r["td"] is not None and r["td"] <= 5]
                         if _ew:
                             _badges.append(f"⏳ 到期周（剩 {'、'.join(_ew)} 个交易日）")
+                        _hits = [r["code"] for r in _rv if r.get("limit_hit")]
+                        if _hits:
+                            _badges.append(f"🚧 触及涨跌停区间（{'、'.join(_hits)}）——今日谨慎挂价")
                         if _badges:
                             (_st.error if _worst == "STRONG" else _st.warning)(" · ".join(_badges))
                 with cB:

@@ -49,7 +49,7 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         asof = session.execute(select(func.max(PositionSnapshot.date))).scalar_one()
     if asof is None:
         return {"asof": None, "rows": [], "total_margin_est": 0.0,
-                "max_loss_level": None, "expiry_week": []}
+                "max_loss_level": None, "expiry_week": [], "price_limit_hits": []}
 
     snaps = {s.position_id: s for s in session.execute(
         select(PositionSnapshot).where(PositionSnapshot.date == asof)).scalars().all()}
@@ -67,6 +67,18 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         margin = pr.estimate_margin_short(cur_px, s.spot) * abs(qty) if qty < 0 else 0.0
         exp = pr.parse_expiry(p.code)
         td_left = cal.countdown(asof, exp) if exp else None
+        # §20.2 #5 涨跌停可执行性：前一日快照 px 为"前结算"代理（mark 非 official settle，注明局限）
+        limit_hit = None
+        if abs(qty) > 0:
+            prev2 = session.execute(
+                select(PositionSnapshot)
+                .where(PositionSnapshot.position_id == p.id, PositionSnapshot.date < asof)
+                .order_by(PositionSnapshot.date.desc()).limit(1)).scalar_one_or_none()
+            if prev2 is not None:
+                prev_px = abs(prev2.mv) / (abs(qty) * pr.UNIT)
+                band = pr.price_limit_band(prev_px, prev2.spot)
+                if band and not (band[0] <= cur_px <= band[1]):
+                    limit_hit = "UP" if cur_px > band[1] else "DOWN"
         rows.append({
             "code": p.code, "qty": qty, "open_px": p.open_px, "cur_px": round(cur_px, 4),
             "unrealized_pnl": round(pr.unrealized_pnl(s.mv, qty, p.open_px), 2),
@@ -75,6 +87,7 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
             "expiry": str(exp) if exp else None,
             "trading_days_left": td_left,
             "expiry_week": td_left is not None and td_left <= pr.EXPIRY_WEEK_DAYS,
+            "price_limit_hit": limit_hit,
         })
 
     levels = [r["loss_level"] for r in rows if r["loss_level"]]
@@ -83,6 +96,7 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         "total_margin_est": round(sum(r["margin_est"] for r in rows), 2),
         "max_loss_level": "STRONG" if "STRONG" in levels else ("WARN" if "WARN" in levels else None),
         "expiry_week": [r["code"] for r in rows if r["expiry_week"]],
+        "price_limit_hits": [f"{r['code']}({r['price_limit_hit']})" for r in rows if r["price_limit_hit"]],
     }
 
 
@@ -111,16 +125,20 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
     checks.append({"name": "delta_limit", "passed": delta_ok,
                    "detail": f"组合delta={delta:.1f}, 限额±{settings.delta_limit}"})
 
-    # ④ 持仓风险评审（§20.2 P1）：浮亏触发线 + 到期周 + 保证金占用
+    # ④ 持仓风险评审（§20.2 P1）：浮亏触发线 + 到期周 + 保证金占用 + 涨跌停（P2）
     review = position_risk_review(session)
     loss_ok = review["max_loss_level"] != "STRONG"
     checks.append({"name": "floating_loss", "passed": loss_ok,
                    "detail": (f"最差浮亏等级={review['max_loss_level'] or '正常'}"
                               f"（阈值：≥50% WARN / ≥100% STRONG，权利金口径）")})
     expiry_week = review["expiry_week"]
+    limit_ok = not review["price_limit_hits"]
+    checks.append({"name": "price_limit", "passed": limit_ok,
+                   "detail": ("相关合约在涨跌停区间内" if limit_ok
+                              else f"触及涨跌停区间：{'、'.join(review['price_limit_hits'])}（今日可能无法成交/流动性枯竭）")})
 
     hard_fail = not valid
-    soft_warn = not (vega_ok and delta_ok and loss_ok)
+    soft_warn = not (vega_ok and delta_ok and loss_ok and limit_ok)
     verdict = "REJECT" if hard_fail else ("WARN" if soft_warn else "PASS")
 
     action = _ACTION.get(sig.signal, "观望")
@@ -134,6 +152,8 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
         action += "；🚨 现有持仓浮亏已达权利金 100%，行业惯例优先处理亏损头寸而非加新仓"
     if expiry_week:
         action += f"；⏳ 到期周提醒（剩≤5个交易日：{'、'.join(expiry_week)}）——注意 pin risk 与行权指派，行业惯例提前移仓"
+    if not limit_ok:
+        action += "；🚧 相关合约触及涨跌停区间——今日可能挂不出去或流动性枯竭，执行窗口内先核对盘口再动手"
 
     card = {
         "date": str(sig.date), "signal": sig.signal, "action": action,

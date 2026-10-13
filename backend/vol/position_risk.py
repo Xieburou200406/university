@@ -64,3 +64,35 @@ def parse_expiry(code: str) -> date | None:
         except ValueError:
             return None
     return None
+
+
+# ---------------------------------------------------------------- §20.2 #5 涨跌停
+# 上交所 ETF 期权每日价格涨跌停（合约公开规格；参考知识库仅载机制，公式自上交所细则）：
+#   认购：涨幅 = Max{0.5%×前结算, Min[10%×(2×前结算−标的前收), 10%×标的前收]}；跌幅 = 10%×前结算
+#   认沽：涨幅 = Max{0.5%×前结算, Min[10%×(2×标的前收−前结算), 10%×标的前收]}；跌幅 = 10%×前结算
+# kind=None（跨式/未知类型）：取认购买卖区间与认沽区间的 **并集（更宽者）** ——
+#   合成定价的跨式账本腿价按同一数值存储，真实市场里深虚值认购腿日涨幅被压在 0.5% 地板，
+#   交集口径会让合成数据天天"越界"（警报疲劳）；单腿真实合约（kind=C/P）走精确口径。
+
+def price_limit_band(settle_px: float, spot_prev: float,
+                     kind: str | None = "C") -> tuple[float, float] | None:
+    """返回 (跌停价, 涨停价)。settle_px=合约前结算价，spot_prev=标的前收盘价。
+    入参非正 → None（fail-soft）。注意：这是 **价格** 限制（期权自身有涨跌停板，
+    非标的±10% 的粗略推算——深度虚值腿的上界可能远窄于 10%）。"""
+    if settle_px <= 0 or spot_prev <= 0:
+        return None
+    lower = settle_px * 0.90
+
+    if kind == "C":
+        upper = settle_px + max(0.005 * settle_px,
+                                min(0.10 * (2 * settle_px - spot_prev), 0.10 * spot_prev))
+    elif kind == "P":
+        upper = settle_px + max(0.005 * settle_px,
+                                min(0.10 * (2 * spot_prev - settle_px), 0.10 * spot_prev))
+    else:                                       # None：并集（更宽者，见模块注释）
+        up_c = settle_px + max(0.005 * settle_px,
+                               min(0.10 * (2 * settle_px - spot_prev), 0.10 * spot_prev))
+        up_p = settle_px + max(0.005 * settle_px,
+                               min(0.10 * (2 * spot_prev - settle_px), 0.10 * spot_prev))
+        upper = max(up_c, up_p)
+    return lower, upper
