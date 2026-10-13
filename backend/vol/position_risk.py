@@ -66,6 +66,13 @@ def parse_expiry(code: str) -> date | None:
     return None
 
 
+def kind_from_code(code: str) -> str | None:
+    """从合约码识别期权类型：真实码 '510050C2610...' → 'C'/'P'；
+    demo 账本码（STRADDLE 等）无类型 → None（涨跌停走并集宽口径）。"""
+    m = re.match(r"510050([CP])", str(code))
+    return m.group(1) if m else None
+
+
 # ---------------------------------------------------------------- §20.2 #5 涨跌停
 # 上交所 ETF 期权每日价格涨跌停（合约公开规格；参考知识库仅载机制，公式自上交所细则）：
 #   认购：涨幅 = Max{0.5%×前结算, Min[10%×(2×前结算−标的前收), 10%×标的前收]}；跌幅 = 10%×前结算

@@ -76,7 +76,7 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
                 .order_by(PositionSnapshot.date.desc()).limit(1)).scalar_one_or_none()
             if prev2 is not None:
                 prev_px = abs(prev2.mv) / (abs(qty) * pr.UNIT)
-                band = pr.price_limit_band(prev_px, prev2.spot)
+                band = pr.price_limit_band(prev_px, prev2.spot, pr.kind_from_code(p.code))
                 if band and not (band[0] <= cur_px <= band[1]):
                     limit_hit = "UP" if cur_px > band[1] else "DOWN"
         rows.append({

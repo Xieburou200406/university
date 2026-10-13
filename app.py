@@ -57,7 +57,7 @@ def _position_review(db_path):
             hit = None
             if len(r2) == 2 and abs(qty) > 0:
                 prev_px = abs(r2[1][1]) / (abs(qty) * pr.UNIT)
-                band = pr.price_limit_band(prev_px, r2[1][2])
+                band = pr.price_limit_band(prev_px, r2[1][2], pr.kind_from_code(code))
                 if band and not (band[0] <= cur_px <= band[1]):
                     hit = "UP" if cur_px > band[1] else "DOWN"
             rows.append({"code": code, "ratio": ratio, "level": level, "margin": margin,

@@ -172,6 +172,17 @@ def test_price_limit_band_fail_soft():
     assert pr.price_limit_band(0.05, -1.0) is None
 
 
+def test_kind_from_code_drives_band_choice():
+    # 真实码 → 精确口径；demo 账本码 → None（并集宽口径）
+    assert pr.kind_from_code("510050C2610M02800") == "C"
+    assert pr.kind_from_code("510050P2610M02800") == "P"
+    assert pr.kind_from_code("STRADDLE K=3.0 2026-10-28") is None
+    # 回归锁：真实认购码在深虚值处上界必须紧（0.5% 地板），None 则宽
+    _, hi_c = pr.price_limit_band(0.0512283, 2.918, pr.kind_from_code("510050C2610M02800"))
+    _, hi_n = pr.price_limit_band(0.0512283, 2.918, pr.kind_from_code("STRADDLE K=3.0 2026-10-28"))
+    assert hi_c < hi_n
+
+
 # ---------- services 聚合：涨跌停越界 ----------
 
 def test_review_price_limit_hit_detection(session):
