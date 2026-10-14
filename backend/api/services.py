@@ -243,11 +243,44 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
                                   "date": d_str.replace("-", ""), "valid_until": str(r.valid_until)})
     _safe_log("P", "pipeline", {"step": "compute_daily", "ok": 1,
                                 "ms": int((time.perf_counter() - t0) * 1000)})
+    jump = _iv_jump_review(session, d, {})          # §17.6：跳变留痕 + 连续跳变降级
     return {"date": d_str, "percentile": pct["signal"], "analog": ana_sig,
-            "agree": agree, "iv_now": round(iv_now, 4), "iv_pct_120": pct.get("iv_pct")}
+            "agree": agree, "iv_now": round(iv_now, 4), "iv_pct_120": pct.get("iv_pct"),
+            "iv_jump": jump["iv_jump"], "iv_degrade": jump["iv_degrade"]}
 
 
 LAMBDA_MAP = {"conservative": 8.0, "balanced": 4.0, "aggressive": 2.0}   # §14.1 三档
+
+# §17.6 跳变留痕与保护性降级：iv_pct_120 单日变动 > 0.30（分位口径 0~1）→ 跳变；
+# 连续 2 个跳变日 → 信号链降级标记（首页角标，不硬给结论）。
+JUMP_THRESHOLD = 0.30
+
+
+def _iv_jump_review(session: Session, d: date, summary: dict) -> dict:
+    """IV 跳变审查（§17.6）：比对最近 3 个 DailyMetric 的 iv_pct_120。
+    单日跳变 → X|jump 留痕（当日原始数据 = DailyMetric 行本身，落库即留痕）；
+    连续 2 个跳变日 → X|degrade + summary 标记 iv_degrade=True（信号链降级，与 §16.4 衔接）。"""
+    rows = session.execute(
+        select(DailyMetric).where(DailyMetric.date <= d)
+        .order_by(DailyMetric.date.desc()).limit(3)).scalars().all()
+    vals = [(r.date, r.iv_pct_120) for r in rows]           # [今日, 昨日, 前日]
+
+    def _jump(a, b) -> bool:
+        return a is not None and b is not None and abs(a - b) > JUMP_THRESHOLD
+
+    jump_today = len(vals) >= 2 and _jump(vals[0][1], vals[1][1])
+    out = {"iv_jump": jump_today, "iv_degrade": False}
+    if jump_today:
+        delta = round(vals[0][1] - vals[1][1], 4)
+        _safe_log("X", "jump", {"date": str(vals[0][0]).replace("-", ""),
+                                "from": vals[1][1], "to": vals[0][1], "delta": delta,
+                                "note": "IV 单日跳变>30分位；原始数据见 daily_metric 当日行"})
+        out["iv_delta"] = delta
+        if len(vals) >= 3 and _jump(vals[1][1], vals[2][1]):
+            out["iv_degrade"] = True
+            _safe_log("X", "degrade", {"date": str(vals[0][0]).replace("-", ""),
+                                       "note": "连续2日IV跳变 → 信号链降级标记，结论仅作参考"})
+    return out
 
 
 # ---- §18.6 建议生命周期：滞留-采纳闭环 ----

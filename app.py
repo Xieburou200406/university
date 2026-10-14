@@ -162,6 +162,28 @@ st.sidebar.metric("本地历史", f"{len(df)} 交易日")
 st.sidebar.caption(f"{df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
 cal = get_calendar()
 st.sidebar.caption(cal.status_label())
+
+
+@st.cache_data(ttl=60)
+def _iv_degrade_state() -> bool:
+    """§17.6 降级角标：正式库最近 3 日 iv_pct_120 连续两日单日变动 > 0.30 → True。
+    与 services._iv_jump_review 同阈值同口径（此处只读不写）。"""
+    import sqlite3 as _sq
+    con = _sq.connect(DB_PATH)
+    try:
+        rows = con.execute("SELECT iv_pct_120 FROM daily_metric ORDER BY date DESC LIMIT 3").fetchall()
+    finally:
+        con.close()
+    vals = [r[0] for r in rows if r[0] is not None]
+    if len(vals) < 3:
+        return False
+    return all(abs(vals[i] - vals[i + 1]) > 0.30 for i in range(2))
+
+
+if _iv_degrade_state():
+    st.sidebar.error("⚠️ IV 连续两日跳变（>30 分位）——信号链降级中，结论仅作参考")
+
+
 st.sidebar.caption("铁律：只输出建议，永不自动下单；\n信号 T 日生成、T+1 执行窗口内有效。")
 
 if st.sidebar.button("刷新数据（显式联网，约 30 秒）"):

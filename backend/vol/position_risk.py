@@ -103,3 +103,23 @@ def price_limit_band(settle_px: float, spot_prev: float,
                                min(0.10 * (2 * spot_prev - settle_px), 0.10 * spot_prev))
         upper = max(up_c, up_p)
     return lower, upper
+
+
+# ---------------------------------------------------------------- §17.2 快照差分归因（唯一实现）
+# 铁律：累计快照只能差分，禁止把"刷新值"当"盈亏值"直接加总（对齐 QS 两条铁律之一）。
+# panel/面板此前各自内联 diff().fillna(0).cumsum()——收敛到这里成为单一来源。
+
+def pnl_daily_attribution(mvs) -> tuple[list[float], list[float]]:
+    """快照差分归因：返回 (逐日盈亏, 累计盈亏)。
+    逐日 = mv.diff()（首日无前值记 0）；累计 = 逐日 cumsum。
+    数学闭合：累计[-1] == mv[-1] - mv[0]（伸缩恒等式，±1 tick 结案标准的机器表达）。"""
+    mvs = [float(v) for v in mvs]
+    if not mvs:
+        return [], []
+    daily = [0.0] + [mvs[i] - mvs[i - 1] for i in range(1, len(mvs))]
+    cum: list[float] = []
+    acc = 0.0
+    for v in daily:
+        acc += v
+        cum.append(acc)
+    return daily, cum
