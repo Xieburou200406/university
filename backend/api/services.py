@@ -487,3 +487,75 @@ def trigger_pipeline(session: Session, fetch_df=None) -> PipelineRun:
         _safe_log("X", "pipeline", {"reason": "failed", "detail": str(e)[:150]})
         raise
     return run
+
+
+# ---------------------------------------------------------------- §17.4 排查六步（一键体检）
+def run_diagnosis(session: Session) -> dict:
+    """排查 Runbook 六步自动执行（§17.4）。只读不写；每步 ok + 人话 detail。
+    步5/步6 对齐"数学闭合结案"：快照差分 + 伸缩恒等式（±1 tick = 1e-6 元）。"""
+    from vol import opslog
+    steps: list[dict] = []
+
+    # ① 数据到了吗：最近管线状态 + D|panel
+    run = session.execute(select(PipelineRun).order_by(PipelineRun.id.desc())
+                          .limit(1)).scalar_one_or_none()
+    n_d = len(opslog.read_events(code="D", key="panel"))
+    steps.append({"step": 1, "q": "数据到了吗", "ok": run is not None and run.status == "ok",
+                  "detail": f"最近管线: {run.status if run else '无记录'}；D|panel 日志 {n_d} 条"})
+
+    # ② 特征齐吗：最新 daily_metric 特征列有无 None
+    dm = session.execute(select(DailyMetric).order_by(DailyMetric.date.desc())
+                         .limit(1)).scalar_one_or_none()
+    if dm is None:
+        steps.append({"step": 2, "q": "特征齐吗", "ok": False, "detail": "daily_metric 为空"})
+    else:
+        holes = [c for c in ("iv_pct_120", "skew_25d", "momentum_20d") if getattr(dm, c) is None]
+        steps.append({"step": 2, "q": "特征齐吗", "ok": not holes,
+                      "detail": f"{dm.date}: " + ("特征完整" if not holes else f"缺 {holes}")})
+
+    # ③ 弃权原因是什么：X 事件 + 最新预测 reason
+    fc = session.execute(select(OpenForecast).order_by(OpenForecast.date.desc())
+                         .limit(1)).scalar_one_or_none()
+    n_x = len(opslog.read_events(code="X"))
+    abst = bool(fc.abstain) if fc else None
+    steps.append({"step": 3, "q": "弃权原因是什么",
+                  "ok": abst is False,
+                  "detail": ("尚无预测记录" if fc is None else
+                             (f"{fc.date} 弃权: {fc.reason}" if abst else f"{fc.date} 正常出预测"))
+                             + f"；X| 事件 {n_x} 条"})
+
+    # ④ 预算为什么降级：最新 RiskBudget
+    rb = session.execute(select(RiskBudget).order_by(RiskBudget.date.desc())
+                         .limit(1)).scalar_one_or_none()
+    reason4 = (rb.notes_json or {}).get("reason") if rb else None
+    steps.append({"step": 4, "q": "预算为什么降级",
+                  "ok": rb is not None and not rb.degraded,
+                  "detail": ("尚无预算记录" if rb is None else
+                             f"{rb.date}: confidence={rb.confidence}, degraded={rb.degraded}"
+                             + (f", 原因: {reason4}" if reason4 else ""))})
+
+    # ⑤⑤ 快照对账（阶跃点）+ ⑥ 数学闭合
+    positions = session.execute(
+        select(Position).where(func.upper(Position.status) == "OPEN")).scalars().all()
+    jumps, closes = [], []
+    for p in positions:
+        snaps = session.execute(
+            select(PositionSnapshot).where(PositionSnapshot.position_id == p.id)
+            .order_by(PositionSnapshot.date)).scalars().all()
+        if len(snaps) < 2:
+            continue
+        mvs = [s.mv for s in snaps]
+        daily, cum = pr.pnl_daily_attribution(mvs)
+        big = max(range(1, len(daily)), key=lambda i: abs(daily[i]))
+        jumps.append(f"{p.code}: {snaps[big].date} 单日 {daily[big]:+.2f} 元")
+        closes.append(abs(cum[-1] - (mvs[-1] - mvs[0])) <= 1e-6)
+    n_pos = len(positions)
+    steps.append({"step": 5, "q": "快照对账（阶跃点）", "ok": True,
+                  "detail": (f"open 持仓 {n_pos} 个；最大阶跃: {'; '.join(jumps) if jumps else '无快照序列'}")})
+    ok6 = all(closes) if closes else True
+    steps.append({"step": 6, "q": "数学闭合结案", "ok": ok6,
+                  "detail": ("全部持仓伸缩恒等式闭合（≤±1 tick）" if closes else "无快照序列，跳过")})
+
+    rep = {"all_ok": all(s["ok"] for s in steps if s["step"] != 5), "steps": steps}
+    _safe_log("P", "diagnosis", {"all_ok": rep["all_ok"], "steps": len(steps)})
+    return rep

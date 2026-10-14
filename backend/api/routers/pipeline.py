@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_db
 from api.schemas import PipelineRunOut, ReviewLogOut
-from api.services import trigger_pipeline
+from api.services import run_diagnosis, trigger_pipeline
 from db.models import PipelineRun, ReviewLog
 
 
@@ -28,6 +28,11 @@ def pipeline_router() -> APIRouter:
     def list_runs(limit: int = 10, db: Session = Depends(get_db)):
         return db.execute(select(PipelineRun).order_by(PipelineRun.id.desc())
                           .limit(min(limit, 50))).scalars().all()
+
+    @r.get("/pipeline/diagnosis")
+    def diagnosis(db: Session = Depends(get_db)):
+        """§17.4 排查六步一键体检（只读）。步骤5 恒为信息性，不计入 all_ok。"""
+        return run_diagnosis(db)
 
     @r.post("/pipeline/run", response_model=PipelineRunOut)
     def run(db: Session = Depends(get_db)):

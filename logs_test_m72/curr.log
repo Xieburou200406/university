@@ -7,3 +7,6 @@
 16:18:20|X|jump|date=20261007 from=0.5 to=0.85 delta=0.35 note=IV 单日跳变>30分位；原始数据见 daily_metric 当日行
 16:18:20|X|jump|date=20261008 from=0.85 to=0.5 delta=-0.35 note=IV 单日跳变>30分位；原始数据见 daily_metric 当日行
 16:18:20|X|degrade|date=20261008 note=连续2日IV跳变 → 信号链降级标记，结论仅作参考
+16:28:57|X|jump|date=20261007 from=0.5 to=0.85 delta=0.35 note=IV 单日跳变>30分位；原始数据见 daily_metric 当日行
+16:28:57|X|jump|date=20261008 from=0.85 to=0.5 delta=-0.35 note=IV 单日跳变>30分位；原始数据见 daily_metric 当日行
+16:28:57|X|degrade|date=20261008 note=连续2日IV跳变 → 信号链降级标记，结论仅作参考

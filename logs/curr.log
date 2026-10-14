@@ -9,3 +9,4 @@
 15:44:25|S|signal|engine=ensemble verdict=NEUTRAL date=20260518 valid_until=2026-05-19
 15:44:25|P|pipeline|step=compute_daily ok=1 ms=935
 15:44:56|A|advice|card=2 verdict=WARN signal=SHORT_VOL valid_until=2026-10-15
+16:29:10|P|diagnosis|all_ok=False steps=6

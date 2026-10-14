@@ -371,6 +371,21 @@ with tab3:
             st.info("暂无持仓快照 —— 先在归因 Tab 生成示例持仓")
     except Exception:
         st.info("暂无账本数据 —— 运行归因 Tab 的示例回放后显示")
+
+    # §17.4 排查六步一键体检（只读，直查正式库）
+    with st.expander("🔧 运维体检（排查六步）"):
+        if st.button("运行体检", key="btn_diag"):
+            try:
+                from api.services import run_diagnosis
+                from db.session import make_engine, make_session
+                SM, _ = make_session(make_engine(f"sqlite:///{DB_PATH}"))
+                rep = run_diagnosis(SM())
+                for s_ in rep["steps"]:
+                    icon = "✅" if s_["ok"] or s_["step"] == 5 else ("ℹ️" if s_["step"] == 5 else "⚠️")
+                    st.markdown(f"**{icon} 步{s_['step']} · {s_['q']}** — {s_['detail']}")
+                st.caption("总体: " + ("全绿 ✅" if rep["all_ok"] else "存在 ⚠️ 项，按步排查"))
+            except Exception as e:                     # noqa: BLE001 —— 体检失败不影响主面板
+                st.warning(f"体检失败：{e}")
     st.divider()
     st.markdown("**风控条件链（建议仓位逐级收窄）**")
     chain = [
