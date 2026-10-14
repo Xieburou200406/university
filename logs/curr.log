@@ -1,0 +1,11 @@
+15:44:24|A|advice|card=1 verdict=PASS signal=SHORT_VOL valid_until=2026-10-15
+15:44:24|A|advice|card=1 verdict=WARN signal=SHORT_VOL valid_until=2026-10-15
+15:44:24|A|advice|card=1 verdict=REJECT signal=LONG_VOL valid_until=2026-09-02
+15:44:24|X|pipeline|reason=reentry detail=run=1 仍在运行
+15:44:24|X|pipeline|reason=failed detail=面板不可用
+15:44:24|D|panel|date=20260518 rows=130 src=injected
+15:44:25|S|signal|engine=percentile verdict=NEUTRAL date=20260518 valid_until=2026-05-19
+15:44:25|S|signal|engine=analog verdict=NEUTRAL date=20260518 valid_until=2026-05-19
+15:44:25|S|signal|engine=ensemble verdict=NEUTRAL date=20260518 valid_until=2026-05-19
+15:44:25|P|pipeline|step=compute_daily ok=1 ms=935
+15:44:56|A|advice|card=2 verdict=WARN signal=SHORT_VOL valid_until=2026-10-15

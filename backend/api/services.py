@@ -2,6 +2,7 @@
 """业务服务层：①建议卡片生成（风控链 trace）②每日信号管线（复用 m2/m3 已迁移的领域包）。
 铁律 7：任何一步失败即 fail-closed（不出卡 / 管线标记 failed）。铁律 8：T+1 过期作废。"""
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
                        Position, PositionSnapshot, RiskBudget, Signal)
+from vol import opslog
 from vol import position_risk as pr
 from vol.calendar import get_calendar
 from vol.config import Settings
@@ -20,6 +22,14 @@ if str(_ROOT) not in sys.path:          # m2/m3 在仓库根
 
 _ACTION = {"SHORT_VOL": "倾向卖波（收权利金方向）", "LONG_VOL": "倾向买波（波动率多头方向）",
            "NEUTRAL": "观望", "WAIT": "观望", "INSUFFICIENT_HISTORY": "观望（历史不足）"}
+
+
+def _safe_log(code: str, key: str, fields: dict | None = None) -> None:
+    """M7-① 结构化事件日志（§17.1）。日志失败绝不影响业务——日志是运维眼睛，不是业务路径。"""
+    try:
+        opslog.log_event(code, key, fields)
+    except Exception:                               # noqa: BLE001
+        pass
 
 
 def _exec_window(d: date) -> str:
@@ -167,6 +177,8 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
                     card_json=card)
     session.add(ac)
     session.flush()
+    _safe_log("A", "advice", {"card": ac.id, "verdict": verdict, "signal": sig.signal,
+                              "valid_until": str(sig.valid_until)})
     return ac
 
 
@@ -180,7 +192,11 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
     else:
         df = fetch_df
     if df is None or len(df) < 2:
+        _safe_log("X", "pipeline", {"reason": "no_panel", "detail": "面板数据不可用（fail-closed）"})
         raise RuntimeError("面板数据不可用（fail-closed）")
+    t0 = time.perf_counter()
+    _safe_log("D", "panel", {"date": str(df["date"].iloc[-1]).replace("-", ""),
+                             "rows": len(df), "src": "injected" if fetch_df is not None else "akshare"})
 
     from vol.signals import PercentileEngine
     eng = PercentileEngine(window=settings.window, confirm_days=settings.confirm_days)
@@ -222,6 +238,11 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
                                     "note": "同向增强；不一致则降级参考"}))
     session.add_all(rows)
     session.flush()
+    for r in rows:                                   # M7-①：明细级 S| 每条信号一行（负记录：NEUTRAL 也记）
+        _safe_log("S", "signal", {"engine": r.engine, "verdict": r.signal,
+                                  "date": d_str.replace("-", ""), "valid_until": str(r.valid_until)})
+    _safe_log("P", "pipeline", {"step": "compute_daily", "ok": 1,
+                                "ms": int((time.perf_counter() - t0) * 1000)})
     return {"date": d_str, "percentile": pct["signal"], "analog": ana_sig,
             "agree": agree, "iv_now": round(iv_now, 4), "iv_pct_120": pct.get("iv_pct")}
 
@@ -320,6 +341,10 @@ def compute_and_store_forecast(session: Session, settings: Settings, df,
         row.model_ver, row.p_up_raw, row.p_up_cal = "lr-irls-v1", fc.p_up_raw, fc.p_up_cal
         row.abstain, row.reason, row.features_json = fc.abstain, fc.reason, fc.coef
         session.flush()
+        # 负记录原则（§17.1）：弃权也落明文，日志必须能回答"为什么没给预测"
+        _safe_log("F" if not fc.abstain else "X", "forecast",
+                  {"date": d.strftime("%Y%m%d"), "p_up": round(fc.p_up_cal, 4) if fc.p_up_cal else None,
+                   "reason": fc.reason})
         return row
     except Exception as e:                          # noqa: BLE001 —— 预测失败不拖垮管线
         row = session.get(OpenForecast, d)
@@ -328,6 +353,7 @@ def compute_and_store_forecast(session: Session, settings: Settings, df,
             session.add(row)
         row.abstain, row.reason = True, f"预测管线异常（fail-closed）: {type(e).__name__}: {e}"[:500]
         session.flush()
+        _safe_log("X", "forecast", {"reason": "pipeline_error", "detail": row.reason[:120]})
         return row
 
 
@@ -359,6 +385,8 @@ def compute_and_store_budget(session: Session, settings: Settings, df,
         row.confidence, row.degraded = res.confidence, res.degraded
         row.notes_json = {"reason": res.reason, "checks": res.checks, "state": [res.vega_state, res.delta_state]}
         session.flush()
+        _safe_log("B", "budget", {"lambda": lambda_level, "target_vega": round(res.target_vega, 3),
+                                  "conf": res.confidence, "degraded": int(res.degraded)})
         return row
     except Exception as e:                          # noqa: BLE001 —— 预算失败落降级行
         _, cur_vega, cur_delta = latest_exposure(session)
@@ -373,6 +401,7 @@ def compute_and_store_budget(session: Session, settings: Settings, df,
         row.confidence, row.degraded = "LOW", True
         row.notes_json = {"reason": f"预算管线异常（fail-closed）: {type(e).__name__}: {e}"[:500]}
         session.flush()
+        _safe_log("X", "budget", {"reason": "pipeline_error", "detail": row.notes_json["reason"][:120]})
         return row
 
 
@@ -405,6 +434,7 @@ def trigger_pipeline(session: Session, fetch_df=None) -> PipelineRun:
     running = session.execute(select(PipelineRun).where(PipelineRun.status == "running")
                               .limit(1)).scalar_one_or_none()
     if running is not None:
+        _safe_log("X", "pipeline", {"reason": "reentry", "detail": f"run={running.id} 仍在运行"})
         raise PermissionError(f"已有管线在运行（id={running.id}，{running.started_at}），拒绝重入")
     run = PipelineRun(status="running")
     session.add(run)
@@ -421,5 +451,6 @@ def trigger_pipeline(session: Session, fetch_df=None) -> PipelineRun:
                           error=str(e)[:2000])      # 新事务补记失败流水
         session.add(err)
         session.commit()
+        _safe_log("X", "pipeline", {"reason": "failed", "detail": str(e)[:150]})
         raise
     return run
