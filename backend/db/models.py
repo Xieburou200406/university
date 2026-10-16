@@ -171,3 +171,74 @@ class RiskBudget(Base):
     degraded: Mapped[bool] = mapped_column(Boolean, default=False)
     notes_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+# ---------------------------------------------------------------- 模拟盘（§12.3，M6-①）
+class SimAccount(Base):
+    """虚拟账户（练手场，与真实账户物理隔离）。"""
+    __tablename__ = "sim_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(32))
+    auto_mirror: Mapped[bool] = mapped_column(Boolean, default=False)   # 跟随建议账户（M6-② 接管）
+    cash0: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(8), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class SimOrder(Base):
+    """模拟订单（模板建仓落成多腿 legs_json）。"""
+    __tablename__ = "sim_order"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("sim_account.id"), index=True)
+    tpl_id: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    legs_json: Mapped[list] = mapped_column(JSON)                        # [{cp,strike,side,qty}]
+    submit_date: Mapped[Date] = mapped_column(Date)
+    expiry: Mapped[Date] = mapped_column(Date)
+    price_type: Mapped[str] = mapped_column(String(8), default="market")
+    limit_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(8), default="pending")    # pending/filled/cancelled
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class SimFill(Base):
+    """撮合回报（每腿一条）。"""
+    __tablename__ = "sim_fill"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("sim_order.id"), index=True)
+    leg_index: Mapped[int] = mapped_column(Integer)
+    cp: Mapped[str] = mapped_column(String(1))
+    strike: Mapped[float] = mapped_column(Float)
+    side: Mapped[str] = mapped_column(String(4))
+    fill_px: Mapped[float] = mapped_column(Float)
+    qty: Mapped[int] = mapped_column(Integer)
+    cost: Mapped[float] = mapped_column(Float)
+    filled_date: Mapped[Date] = mapped_column(Date)
+
+
+class SimNav(Base):
+    """净值打点（回放日频）。同账户同日唯一（重放覆盖）。"""
+    __tablename__ = "sim_nav"
+    __table_args__ = (UniqueConstraint("account_id", "ts", name="uq_simnav_acct_ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("sim_account.id"), index=True)
+    ts: Mapped[Date] = mapped_column(Date)
+    nav: Mapped[float] = mapped_column(Float)
+    mv: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class SimSessionRec(Base):
+    """回放会话记录（§12.3 sim_session）。"""
+    __tablename__ = "sim_session"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mode: Mapped[str] = mapped_column(String(8), default="replay")
+    from_date: Mapped[Date] = mapped_column(Date)
+    to_date: Mapped[Date] = mapped_column(Date)
+    speed: Mapped[float] = mapped_column(Float, default=1.0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)

@@ -49,7 +49,8 @@ def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "ok" and body["advice_only"] is True and body["tables"] == 11
+    # 11 张基础表 + M6 模拟盘 5 张（sim_account/sim_order/sim_fill/sim_nav/sim_session_rec）
+    assert body["status"] == "ok" and body["advice_only"] is True and body["tables"] == 16
 
 
 def test_metrics_list_and_detail(client):

@@ -11,6 +11,11 @@ from sqlalchemy.orm import Session
 
 from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
                        Position, PositionSnapshot, RiskBudget, Signal)
+from db.models import SimAccount as SimAccountDB
+from db.models import SimFill as SimFillDB
+from db.models import SimNav as SimNavDB
+from db.models import SimOrder as SimOrderDB
+from db.models import SimSessionRec as SimSessionRecDB
 from vol import opslog
 from vol import position_risk as pr
 from vol.calendar import get_calendar
@@ -559,3 +564,114 @@ def run_diagnosis(session: Session) -> dict:
     rep = {"all_ok": all(s["ok"] for s in steps if s["step"] != 5), "steps": steps}
     _safe_log("P", "diagnosis", {"all_ok": rep["all_ok"], "steps": len(steps)})
     return rep
+
+
+# ---------------------------------------------------------------- §12 模拟盘（M6-①）
+def create_sim_account(session: Session, name: str, cash0: float,
+                       auto_mirror: bool = False):
+    """创建虚拟账户（与真实账户物理隔离，铁律 10 不受影响）。"""
+    sa_ = SimAccountDB(name=name, cash0=cash0, auto_mirror=auto_mirror)
+    session.add(sa_)
+    session.commit()
+    _safe_log("P", "sim_account", {"id": sa_.id, "cash0": cash0, "auto_mirror": auto_mirror})
+    return sa_
+
+
+def create_sim_order(session: Session, account_id: int, submit_date: date, expiry: date,
+                     tpl_id: str | None = None, params: dict | None = None,
+                     legs: list[dict] | None = None, qty: int = 1,
+                     price_type: str = "market", limit_px: float | None = None):
+    """下单：模板展开（legs 需要下单日 spot）或用户直填 legs。信息墙校验：
+    submit_date 必须有行情截面（不存在 → 404 语义 LookupError）。"""
+    acct = session.get(SimAccountDB, account_id)
+    if acct is None:
+        raise LookupError(f"sim_account {account_id} 不存在")
+    dm = session.execute(
+        select(DailyMetric).where(DailyMetric.date == submit_date)).scalar_one_or_none()
+    if dm is None:
+        raise LookupError(f"submit_date {submit_date} 当日无行情截面（信息墙：不许偷看/虚构未来日期）")
+    if tpl_id:
+        from vol.sim.templates import get_template
+        legs = [l.__dict__ | {"expiry": None} for l in
+                get_template(tpl_id).generate_legs(dm.spot, expiry, qty, params)]
+    if not legs:
+        raise ValueError("legs 为空（模板展开失败或未提供）")
+    o = SimOrderDB(account_id=account_id, tpl_id=tpl_id, params_json=params,
+                   legs_json=legs, submit_date=submit_date, expiry=expiry,
+                   price_type=price_type, limit_px=limit_px)
+    session.add(o)
+    session.commit()
+    _safe_log("P", "sim_order", {"id": o.id, "account": account_id, "tpl": tpl_id,
+                                 "submit": str(submit_date).replace("-", "")})
+    return o
+
+
+def run_sim_replay(session: Session, from_date: date, to_date: date,
+                   account_ids: list[int] | None = None) -> dict:
+    """执行回放（同步，日频）：DailyMetric 截面 → 撮合 pending 单 → 净值打点 → 持久化。
+    幂等：订单状态落库（filled/cancelled）后不重复成交；sim_nav 按 (account, ts) 覆盖。"""
+    import pandas as pd
+    rows = session.execute(
+        select(DailyMetric.date, DailyMetric.spot, DailyMetric.atm_iv)
+        .where(DailyMetric.date >= from_date, DailyMetric.date <= to_date)
+        .order_by(DailyMetric.date)).all()
+    if len(rows) < 2:
+        raise RuntimeError("回放区间内面板数据不足 2 日（fail-closed）")
+    df = pd.DataFrame(rows, columns=["date", "spot", "iv_near"])
+
+    orders_q = (select(SimOrderDB)
+                .where(SimOrderDB.submit_date >= from_date,
+                       SimOrderDB.submit_date <= to_date,
+                       SimOrderDB.status == "pending")
+                .order_by(SimOrderDB.submit_date))
+    if account_ids:
+        orders_q = orders_q.where(SimOrderDB.account_id.in_(account_ids))
+    order_rows = session.execute(orders_q).scalars().all()
+
+    from vol.sim import ReplaySession, SimAccountService, SimLeg, SimOrder
+    svc = SimAccountService()
+    accts = session.execute(select(SimAccountDB)).scalars().all()
+    for a in accts:
+        if account_ids is None or a.id in account_ids:
+            svc.create(a.name, a.cash0, a.auto_mirror)
+    sim_orders = []
+    for o in order_rows:
+        legs = [SimLeg(l["cp"], float(l["strike"]), l["side"], int(l["qty"]))
+                for l in o.legs_json]
+        sim_orders.append(SimOrder(id=o.id, account_id=o.account_id, legs=legs,
+                                   submit_date=o.submit_date, expiry=o.expiry,
+                                   price_type=o.price_type, limit_px=o.limit_px,
+                                   tpl_id=o.tpl_id))
+    res = ReplaySession(svc).run(df, sim_orders, from_date, to_date)
+
+    # 持久化：fills + 订单状态 + nav 覆盖 + 会话记录
+    leg_of = {o.id: o.legs for o in sim_orders}
+    for f in res.fills:
+        legs = leg_of.get(f["order_id"], [])
+        idx = next((i for i, l in enumerate(legs)
+                    if l.cp == f["cp"] and round(l.strike, 4) == round(f["strike"], 4)), 0)
+        session.add(SimFillDB(order_id=f["order_id"], leg_index=idx, cp=f["cp"],
+                              strike=f["strike"], side=f["side"], fill_px=f["fill_px"],
+                              qty=f["qty"], cost=f["cost"],
+                              filled_date=date.fromisoformat(f["date"])))
+    for o in order_rows:
+        matched = next((so for so in sim_orders if so.id == o.id), None)
+        o.status = matched.status if matched else "cancelled"
+    for aid, curve in res.nav.items():
+        for ts, nav in curve:
+            row = session.execute(select(SimNavDB).where(SimNavDB.account_id == aid,
+                                                         SimNavDB.ts == ts)).scalar_one_or_none()
+            if row is None:
+                session.add(SimNavDB(account_id=aid, ts=ts, nav=nav))
+            else:
+                row.nav = nav
+    rec = SimSessionRecDB(mode="replay", from_date=from_date, to_date=to_date,
+                          summary_json={"days": res.days, "events": res.events,
+                                        "fills": len(res.fills)})
+    session.add(rec)
+    session.commit()
+    _safe_log("P", "sim_replay", {"days": res.days, "fills": len(res.fills),
+                                  "events": len(res.events)})
+    return {"session_id": rec.id, "days": res.days, "nav": {str(k): v for k, v in res.nav.items()},
+            "benchmark": [[str(d), v] for d, v in res.benchmark],
+            "fills": res.fills, "events": res.events}
