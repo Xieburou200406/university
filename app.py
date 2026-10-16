@@ -111,9 +111,17 @@ def load_df(v):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def latest_curve(v):
-    """最新一日近月截面（聚合 C/P）→ SVI 拟合 + 偏离。"""
+    """最新"有缓存快照"一日的近月截面（聚合 C/P）→ SVI 拟合 + 偏离。
+    fetch_dates 返回 ETF 日历（可能领先于指标缓存），必须取最后一个有 ri_v2_* 文件的日期，
+    否则节假日/未刷新日直接 FileNotFoundError 白屏。"""
     days = fetch_dates(250)
-    d, px = days[-1]
+    d = px = None
+    for d_, px_ in reversed(days):
+        if os.path.exists(os.path.join(CACHE_DIR, f"ri_v2_{d_.replace('-', '')}.csv")):
+            d, px = d_, px_
+            break
+    if d is None:
+        raise FileNotFoundError("缓存中没有任何期权快照（ri_v2_*）——先点侧栏'刷新数据'")
     t = pd.read_csv(os.path.join(CACHE_DIR, f"ri_v2_{d.replace('-', '')}.csv"), dtype={"code": str})
     t["exp_dt"] = t["code"].map(expiry_from_code)
     d0 = pd.Timestamp(d)
@@ -192,7 +200,8 @@ if st.sidebar.button("刷新数据（显式联网，约 30 秒）"):
     st.cache_data.clear()
     st.sidebar.success("已更新")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 IV 监控", "🎯 信号台", "🛡 风控台", "💰 持仓归因", "🔬 回测"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📈 IV 监控", "🎯 信号台", "🛡 风控台", "💰 持仓归因", "🔬 回测", "🎲 模拟盘"])
 
 # ---------- Tab1 IV 监控 ----------
 
@@ -461,3 +470,151 @@ with tab5:
                      "最大回撤": f"{max_drawdown(nav):.0f}"})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
     st.caption("可交易日约 " + str(len(df) - WINDOW) + " 个，仅覆盖单一 regime；结论待样本 ≥1 年后再下。")
+
+# ---------- Tab6 模拟盘（§12，M6） ----------
+
+with tab6:
+    st.subheader("模拟盘 · 练手场（虚拟资金，与真实账户物理隔离，铁律 10）")
+    st.caption("诚实声明（§12.5）：模拟盘成交假设偏乐观（无排队、无部分成交）；回放期权价是收盘截面 BS 合成价；"
+               "**模拟盈利不构成实盘盈利预期**。跟随建议账户（自动镜像）按稳健档跟随系统建议，与自由账户同场竞技。")
+    try:
+        from api.services import create_sim_account, create_sim_order, run_sim_replay
+        from db.session import make_engine, make_session
+
+        def _sim_session():
+            SM, _ = make_session(make_engine(f"sqlite:///{DB_PATH}"))
+            return SM()
+
+        import sqlite3 as _sq6
+        _con = _sq6.connect(DB_PATH)
+        accts = pd.read_sql_query(
+            "SELECT id, name, cash0, auto_mirror, status FROM sim_account ORDER BY id", _con)
+        fills_db = pd.read_sql_query(
+            "SELECT f.id, o.account_id, f.filled_date, f.cp, f.strike, f.side, f.qty, "
+            "f.fill_px, f.cost FROM sim_fill f JOIN sim_order o ON o.id=f.order_id "
+            "ORDER BY f.id DESC LIMIT 50", _con)
+        _panel_max = _con.execute("SELECT MAX(date) FROM daily_metric").fetchone()[0]
+        _panel_min = _con.execute("SELECT MIN(date) FROM daily_metric").fetchone()[0]
+        _con.close()
+
+        # ---- 账户 ----
+        st.markdown(f"**虚拟账户（{len(accts)}）**")
+        if len(accts):
+            st.dataframe(accts.rename(columns={
+                "id": "ID", "name": "账户名", "cash0": "初始资金(元)",
+                "auto_mirror": "跟随建议", "status": "状态"}),
+                use_container_width=True, height=140)
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with st.form("sim_new_account", border=True):
+            _na = st.text_input("新账户名", value="练习账户", key="sim_acct_name")
+            _nc = st.number_input("初始资金（元）", min_value=10000.0, value=100000.0,
+                                  step=10000.0, key="sim_acct_cash")
+            _nm = st.checkbox("跟随建议（自动镜像，稳健档）", value=False, key="sim_acct_mirror")
+            if st.form_submit_button("➕ 创建账户", use_container_width=True):
+                s = _sim_session()
+                try:
+                    a = create_sim_account(s, _na.strip() or "练习账户", float(_nc), bool(_nm))
+                    st.success(f"已创建账户 #{a.id} {a.name}")
+                    s.close()
+                    st.rerun()
+                except Exception as e:                 # noqa: BLE001
+                    s.close()
+                    st.error(f"创建失败：{e}")
+        st.divider()
+
+        # ---- 下单 ----
+        st.markdown("**下单（自由 / 模板一键建仓）** —— 信息墙：只能用已有行情截面之日提交")
+        if len(accts) == 0:
+            st.info("先创建一个虚拟账户")
+        else:
+            with st.form("sim_new_order", border=True):
+                _acc_map = {f"#{r['id']} {r['name']}": int(r["id"]) for _, r in accts.iterrows()}
+                o1, o2, o3, o4 = st.columns([2, 2, 1, 1])
+                _acc = o1.selectbox("账户", list(_acc_map), key="sim_ord_acct")
+                _tpl = o2.selectbox("策略模板", ["buy_straddle", "sell_straddle", "sell_strangle"],
+                                    format_func={"buy_straddle": "买入跨式（做多波动率）",
+                                                 "sell_straddle": "卖出跨式（收权利金）",
+                                                 "sell_strangle": "卖出宽跨式（虚值收权利金）"}.__getitem__,
+                                    key="sim_ord_tpl")
+                _qty = o3.number_input("张数", min_value=1, value=1, step=1, key="sim_ord_qty")
+                _sub = o4.date_input("提交日（须有截面）",
+                                     value=pd.Timestamp(_panel_max).date() if _panel_max else None,
+                                     key="sim_ord_sub")
+                _exp = st.date_input("到期日", value=None, min_value=_sub or None, key="sim_ord_exp")
+                if st.form_submit_button("📤 提交订单", use_container_width=True):
+                    s = _sim_session()
+                    try:
+                        o = create_sim_order(s, _acc_map[_acc], _sub, _exp,
+                                             tpl_id=_tpl, qty=int(_qty))
+                        st.success(f"订单 #{o.id} 已挂出（pending，{len(o.legs_json)} 腿）")
+                        s.close()
+                        st.rerun()
+                    except LookupError as e:
+                        s.close()
+                        st.error(f"❌ {e}")
+                    except ValueError as e:
+                        s.close()
+                        st.error(f"❌ {e}")
+        st.divider()
+
+        # ---- 回放 ----
+        st.markdown("**回放（时间压缩）** —— 日频收盘截面撮合；面板不足 2 日拒绝（fail-closed）")
+        r1, r2, r3 = st.columns([1, 1, 2])
+        _from = r1.date_input("起", value=pd.Timestamp(_panel_min).date() if _panel_min else None,
+                              key="sim_rp_from")
+        _to = r2.date_input("止", value=pd.Timestamp(_panel_max).date() if _panel_max else None,
+                            key="sim_rp_to")
+        if r3.button("▶️ 运行回放", use_container_width=True, key="sim_rp_btn"):
+            s = _sim_session()
+            try:
+                res = run_sim_replay(s, _from, _to)
+                s.close()
+                st.toast(f"回放完成：{res['days']} 个交易日，{len(res['fills'])} 笔成交")
+                # 净值对比图（红涨绿跌：账户线用主题色，基准灰）
+                fig = go.Figure()
+                _pal = ["#D85A30", "#185FA5", "#0F6E56", "#8A5FBF", "#B8860B"]
+                for i, (aid_str, curve) in enumerate(res["nav"].items()):
+                    _aid = int(aid_str)
+                    _nm = accts.loc[accts["id"] == _aid, "name"].iloc[0] if len(accts) else f"账户{_aid}"
+                    fig.add_trace(go.Scatter(x=[c[0] for c in curve], y=[c[1] for c in curve],
+                                             mode="lines+markers", name=f"{_nm}",
+                                             line=dict(color=_pal[i % len(_pal)], width=2)))
+                if res["benchmark"]:
+                    fig.add_trace(go.Scatter(x=[c[0] for c in res["benchmark"]],
+                                             y=[c[1] for c in res["benchmark"]],
+                                             mode="lines", name="买入持有标的(基准)",
+                                             line=dict(color="#888780", width=1.5, dash="dash")))
+                fig.update_layout(title=f"净值对比（{_from} ~ {_to}）", template="plotly_white",
+                                  height=380, yaxis_title="净值（元）")
+                st.plotly_chart(fig, use_container_width=True)
+                # 事件与成交
+                if res["events"]:
+                    for ev in res["events"]:
+                        st.warning(f"📌 {ev['date']} IV 单日跳变 {ev['from']*100:.1f}% → {ev['to']*100:.1f}%"
+                                   f"（关键事件，复盘重点看这天）")
+                if res["fills"]:
+                    st.dataframe(pd.DataFrame(res["fills"]).rename(columns={
+                        "date": "成交日", "cp": "类型", "strike": "行权价", "side": "方向",
+                        "qty": "张数", "fill_px": "成交价", "cost": "费用(元)"}),
+                        use_container_width=True, height=200)
+                else:
+                    st.info("区间内无成交（订单提交日在区间外 / 已成交 / 已过期作废）")
+            except RuntimeError as e:
+                s.close()
+                st.error(f"❌ {e}")
+            except Exception as e:                         # noqa: BLE001
+                s.close()
+                st.error(f"回放失败：{e}")
+
+        # ---- 成交记录 ----
+        if len(fills_db):
+            st.divider()
+            st.markdown("**最近成交（50 条）**")
+            st.dataframe(fills_db.rename(columns={
+                "id": "回报ID", "account_id": "账户", "filled_date": "成交日", "cp": "类型",
+                "strike": "行权价", "side": "方向", "qty": "张数",
+                "fill_px": "成交价", "cost": "费用(元)"}), use_container_width=True, height=200)
+        st.caption("⏳ 待接入：SSE 流式回放（§12.5）、错单本（亏损超阈自动收录三段复盘）、"
+                   "归因瀑布抽屉。真实数据回放需日线任务累积 ≥2 个交易截面。")
+    except Exception as e:                                 # noqa: BLE001 —— 模拟盘故障不阻断其他 Tab
+        st.warning(f"模拟盘模块未就绪（{type(e).__name__}: {e}）——检查 sim 表是否已迁移（alembic upgrade head）")
