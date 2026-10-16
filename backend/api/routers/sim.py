@@ -72,6 +72,34 @@ def router() -> APIRouter:
         except RuntimeError as e:
             raise HTTPException(502, str(e))
 
+    @r.get("/sim/stream")
+    def stream(from_date: date, to_date: date, account_ids: str | None = None,
+               db: Session = Depends(get_db)):
+        """SSE 流式回放（§12.4）：逐虚拟日推 day 事件（date/nav/fills/events/benchmark），
+        全部日推进完推 done 事件并持久化；客户端中途断开不留脏状态。"""
+        import json
+        from fastapi.responses import StreamingResponse
+        from api.services import stream_sim_replay
+        ids = None
+        if account_ids:
+            try:
+                ids = [int(x) for x in account_ids.split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(422, "account_ids 须为逗号分隔的整数")
+
+        def gen():
+            try:
+                for ev in stream_sim_replay(db, from_date, to_date, ids):
+                    yield (f"event: {ev['event']}\n"
+                           f"data: {json.dumps(ev['data'], ensure_ascii=False, default=str)}\n\n")
+            except RuntimeError as e:
+                yield (f"event: error\ndata: {json.dumps({'detail': str(e)}, ensure_ascii=False)}"
+                       f"\n\n")
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
     @r.get("/sim/accounts/{aid}/nav")
     def nav(aid: int, db: Session = Depends(get_db)):
         rows = db.execute(select(SimNav).where(SimNav.account_id == aid)

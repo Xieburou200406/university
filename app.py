@@ -606,6 +606,69 @@ with tab6:
                 s.close()
                 st.error(f"回放失败：{e}")
 
+        # ---- 逐日步进回放（时间压缩交互版；SSE 内核 /api/sim/stream，步进为无状态等价实现） ----
+        st.divider()
+        st.markdown("**逐日步进回放** —— 每点一次推进一个交易日，便于逐日复盘成交与净值")
+        _step_dates = []
+        try:
+            _con = _sq6.connect(DB_PATH)
+            _step_dates = [r[0] for r in _con.execute(
+                "SELECT DISTINCT date FROM daily_metric ORDER BY date").fetchall()]
+            _con.close()
+        except Exception:
+            pass
+        if len(_step_dates) < 2:
+            st.info("面板数据不足 2 个交易日，步进回放暂不可用（等日线任务积累）")
+        else:
+            if "sim_step_idx" not in st.session_state:
+                st.session_state.sim_step_idx = 1
+            s1, s2 = st.columns([1, 1])
+            if s1.button("⏭ 推进一日", use_container_width=True, key="sim_step_btn"):
+                st.session_state.sim_step_idx = min(st.session_state.sim_step_idx + 1,
+                                                    len(_step_dates) - 1)
+            if s2.button("↩️ 重置", use_container_width=True, key="sim_step_reset"):
+                st.session_state.sim_step_idx = 1
+            _idx = st.session_state.sim_step_idx
+            st.caption(f"已推进到 **{_step_dates[_idx]}**（第 {_idx + 1}/{len(_step_dates)} 个交易日）")
+            try:
+                s = _sim_session()
+                res = run_sim_replay(s, pd.Timestamp(_step_dates[0]).date(),
+                                     pd.Timestamp(_step_dates[_idx]).date())
+                s.close()
+                _m1, _m2, _m3 = st.columns(3)
+                _m1.metric("回放天数", res["days"])
+                _m2.metric("累计成交笔数", len(res["fills"]))
+                _last_fills = [f for f in res["fills"] if f["date"] == _step_dates[_idx]]
+                _m3.metric("当日成交", len(_last_fills))
+                fig = go.Figure()
+                _pal = ["#D85A30", "#185FA5", "#0F6E56", "#8A5FBF", "#B8860B"]
+                for i, (aid_str, curve) in enumerate(res["nav"].items()):
+                    _aid = int(aid_str)
+                    _nm = accts.loc[accts["id"] == _aid, "name"].iloc[0] if len(accts) else f"账户{_aid}"
+                    fig.add_trace(go.Scatter(x=[c[0] for c in curve], y=[c[1] for c in curve],
+                                             mode="lines+markers", name=f"{_nm}",
+                                             line=dict(color=_pal[i % len(_pal)], width=2)))
+                if res["benchmark"]:
+                    fig.add_trace(go.Scatter(x=[c[0] for c in res["benchmark"]],
+                                             y=[c[1] for c in res["benchmark"]],
+                                             mode="lines", name="买入持有标的(基准)",
+                                             line=dict(color="#888780", width=1.5, dash="dash")))
+                fig.update_layout(title=f"步进净值（~{_step_dates[_idx]}）", template="plotly_white",
+                                  height=340, yaxis_title="净值（元）")
+                st.plotly_chart(fig, use_container_width=True)
+                for ev in res["events"]:
+                    if ev["date"] == _step_dates[_idx]:
+                        st.warning(f"📌 当日 IV 跳变 {ev['from']*100:.1f}% → {ev['to']*100:.1f}%")
+                if _last_fills:
+                    st.dataframe(pd.DataFrame(_last_fills).rename(columns={
+                        "date": "成交日", "cp": "类型", "strike": "行权价", "side": "方向",
+                        "qty": "张数", "fill_px": "成交价", "cost": "费用(元)"}),
+                        use_container_width=True, height=180)
+            except RuntimeError as e:
+                st.error(f"❌ {e}")
+            except Exception as e:                         # noqa: BLE001
+                st.error(f"步进失败：{e}")
+
         # ---- 成交记录 ----
         if len(fills_db):
             st.divider()

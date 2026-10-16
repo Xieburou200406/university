@@ -132,6 +132,57 @@ def test_replay_buy_straddle_wins_on_iv_spike():
     assert res.benchmark[-1][1] == pytest.approx(10000.0)        # 标的横盘 → 基准平
 
 
+# ---------- SSE 流式回放（§12.4 run_iter / /api/sim/stream） ----------
+def test_replay_iter_matches_run():
+    """run_iter 与 run 同内核：逐日消费与批量聚合结果一致。"""
+    svc1, svc2 = SimAccountService(), SimAccountService()
+    a1, a2 = svc1.create("批量", 10000.0), svc2.create("流式", 10000.0)
+    iv, spot = [0.20] * 10 + [0.29] * 10, [3.0] * 20
+    expiry = DAYS[-1] + timedelta(days=120)
+    mk = lambda svc, aid: SimOrder(account_id=aid,
+                                   legs=[SimLeg("C", 3.0, "buy", 1), SimLeg("P", 3.0, "buy", 1)],
+                                   submit_date=DAYS[0], expiry=expiry)
+    res1 = ReplaySession(svc1).run(_panel(iv, spot), [mk(svc1, a1.id)], DAYS[0], DAYS[-1])
+    snaps = list(ReplaySession(svc2).run_iter(_panel(iv, spot), [mk(svc2, a2.id)], DAYS[0], DAYS[-1]))
+    assert len(snaps) == 20                        # 每虚拟日一条快照
+    assert all("nav" in s and "fills" in s and "events" in s for s in snaps)
+    res2 = snaps[-1]                               # 最后一条是 StopIteration 前的最后快照
+    # 逐日快照的末日 nav 与批量结果一致
+    assert res1.nav[a1.id][-1][1] == pytest.approx(snaps[-1]["nav"][a2.id], rel=1e-6)
+    assert res1.days == 20
+    # 事件一致性
+    assert any(e["kind"] == "iv_jump" for e in snaps[10]["events"])
+
+
+def test_api_sim_stream(client):
+    from db.models import SimOrder as SimOrderDB
+    from sqlalchemy import select
+    client.post("/api/sim/accounts", json={"name": "流式", "cash0": 50000.0})
+    client.post("/api/sim/orders", json={
+        "account_id": 1, "submit_date": str(DAYS[1]), "expiry": str(DAYS[-1]),
+        "tpl_id": "buy_straddle", "qty": 1})
+    r = client.get("/api/sim/stream", params={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers["content-type"]
+    body = r.text
+    assert body.count("event: day") == 6           # 6 个虚拟日逐日推送
+    assert "event: done" in body
+    assert "event: error" not in body
+    # 持久化已发生：订单 filled，NAV 6 个点
+    import api.deps as deps
+    s = deps.init_engine()()
+    assert s.execute(select(SimOrderDB)).scalars().one().status == "filled"
+    s.close()
+    r = client.get("/api/sim/accounts/1/nav")
+    assert r.status_code == 200 and len(r.json()) == 6
+
+
+def test_api_sim_stream_fail_closed(client):
+    r = client.get("/api/sim/stream", params={"from_date": str(DAYS[0]), "to_date": str(DAYS[0])})
+    assert r.status_code == 200                    # SSE 层恒 200，错误走 error 事件
+    assert "event: error" in r.text and "fail-closed" in r.text
+
+
 # ---------- API 端到端（注入内存库） ----------
 @pytest.fixture()
 def client(monkeypatch):

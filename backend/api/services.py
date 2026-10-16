@@ -615,10 +615,9 @@ def create_sim_order(session: Session, account_id: int, submit_date: date, expir
     return o
 
 
-def run_sim_replay(session: Session, from_date: date, to_date: date,
-                   account_ids: list[int] | None = None) -> dict:
-    """执行回放（同步，日频）：DailyMetric 截面 → 撮合 pending 单 → 净值打点 → 持久化。
-    幂等：订单状态落库（filled/cancelled）后不重复成交；sim_nav 按 (account, ts) 覆盖。"""
+def _replay_setup(session: Session, from_date: date, to_date: date,
+                  account_ids: list[int] | None = None):
+    """批量/流式回放的公共准备：读截面（fail-closed ≥2 日）+ pending 单 + 内存账户。"""
     import pandas as pd
     rows = session.execute(
         select(DailyMetric.date, DailyMetric.spot, DailyMetric.atm_iv)
@@ -637,7 +636,7 @@ def run_sim_replay(session: Session, from_date: date, to_date: date,
         orders_q = orders_q.where(SimOrderDB.account_id.in_(account_ids))
     order_rows = session.execute(orders_q).scalars().all()
 
-    from vol.sim import ReplaySession, SimAccountService, SimLeg, SimOrder
+    from vol.sim import SimAccountService, SimLeg, SimOrder
     svc = SimAccountService()
     accts = session.execute(select(SimAccountDB)).scalars().all()
     for a in accts:
@@ -651,9 +650,12 @@ def run_sim_replay(session: Session, from_date: date, to_date: date,
                                    submit_date=o.submit_date, expiry=o.expiry,
                                    price_type=o.price_type, limit_px=o.limit_px,
                                    tpl_id=o.tpl_id))
-    res = ReplaySession(svc).run(df, sim_orders, from_date, to_date)
+    return df, order_rows, sim_orders, svc
 
-    # 持久化：fills + 订单状态 + nav 覆盖 + 会话记录
+
+def _replay_persist(session: Session, res, order_rows, sim_orders,
+                    from_date: date, to_date: date) -> dict:
+    """回放结果持久化：fills + 订单状态 + nav 覆盖 + 会话记录。幂等（nav 按 (account, ts) 覆盖）。"""
     leg_of = {o.id: o.legs for o in sim_orders}
     for f in res.fills:
         legs = leg_of.get(f["order_id"], [])
@@ -684,3 +686,33 @@ def run_sim_replay(session: Session, from_date: date, to_date: date,
     return {"session_id": rec.id, "days": res.days, "nav": {str(k): v for k, v in res.nav.items()},
             "benchmark": [[str(d), v] for d, v in res.benchmark],
             "fills": res.fills, "events": res.events}
+
+
+def run_sim_replay(session: Session, from_date: date, to_date: date,
+                   account_ids: list[int] | None = None) -> dict:
+    """执行回放（同步，日频）：DailyMetric 截面 → 撮合 pending 单 → 净值打点 → 持久化。
+    幂等：订单状态落库（filled/cancelled）后不重复成交；sim_nav 按 (account, ts) 覆盖。"""
+    df, order_rows, sim_orders, svc = _replay_setup(session, from_date, to_date, account_ids)
+    from vol.sim import ReplaySession
+    res = ReplaySession(svc).run(df, sim_orders, from_date, to_date)
+    return _replay_persist(session, res, order_rows, sim_orders, from_date, to_date)
+
+
+def stream_sim_replay(session: Session, from_date: date, to_date: date,
+                      account_ids: list[int] | None = None):
+    """流式回放生成器（§12.4 GET /api/sim/stream 的 SSE 内核）：
+    逐虚拟日 yield {"event": "day", "data": 快照}；全部日推进完才持久化并 yield "done"。
+    客户端中途断开 → 生成器被关闭 → 不持久化（不完整会话不留痕，防脏状态）。"""
+    df, order_rows, sim_orders, svc = _replay_setup(session, from_date, to_date, account_ids)
+    from vol.sim import ReplaySession
+    gen = ReplaySession(svc).run_iter(df, sim_orders, from_date, to_date)
+    res = None
+    while True:
+        try:
+            snap = next(gen)
+        except StopIteration as e:
+            res = e.value
+            break
+        yield {"event": "day", "data": snap}
+    out = _replay_persist(session, res, order_rows, sim_orders, from_date, to_date)
+    yield {"event": "done", "data": out}
