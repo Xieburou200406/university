@@ -183,6 +183,68 @@ def test_api_sim_stream_fail_closed(client):
     assert "event: error" in r.text and "fail-closed" in r.text
 
 
+# ---------- 错单本（§12.4 游戏化复盘） ----------
+def _seed_journal_world(s, iv_path):
+    """4 日截面（IV 路径给定，spot 平走）+ 信号 + 买跨式订单。返回 (sig, d0, days)。"""
+    from db.models import DailyMetric, Signal
+    d0 = date.today()
+    days = [d0 + timedelta(days=i) for i in range(4)]
+    for i, dt in enumerate(days):
+        s.add(DailyMetric(date=dt, spot=2.9, atm_iv=iv_path[i], iv_pct_40=0.5))
+    s.commit()
+    sig = Signal(date=d0, engine="percentile", signal="LONG_VOL", confidence=0.9,
+                 valid_until=d0 + timedelta(days=1))
+    s.add(sig)
+    s.commit()
+    return sig, d0, days
+
+
+def test_journal_catches_iv_crush_loss():
+    """IV 衰减 + 标的横盘 → 买跨式浮亏，应被错单本收录且三段齐全。"""
+    from api.services import mis_trade_journal, run_sim_replay
+    from api.services import create_sim_account, create_sim_order
+    s = _memory_session()
+    sig, d0, days = _seed_journal_world(s, [0.20, 0.19, 0.17, 0.15])
+    a = create_sim_account(s, "自由", 100000.0)
+    o = create_sim_order(s, a.id, d0, d0 + timedelta(days=120), tpl_id="buy_straddle", qty=1)
+    res = run_sim_replay(s, d0, days[-1])
+    assert res["fills"]                                        # 已成交
+    j = mis_trade_journal(s, d0, days[-1], threshold=-50.0)
+    assert len(j) == 1
+    e = j[0]
+    assert e["order_id"] == o.id and e["pnl"] <= -50.0
+    assert "LONG_VOL" in e["signal"]                           # ① 当时信号
+    assert "buy" in str(e["legs"]).lower() or e["legs"][0]["side"] == "buy"   # ② 你做了什么
+    assert "20.00%" in e["iv_story"] and "15.00%" in e["iv_story"]            # ③ IV 走势
+
+
+def test_journal_skips_profitable_orders():
+    """IV 飙升 → 买跨式盈利，错单本为空。"""
+    from api.services import mis_trade_journal, run_sim_replay
+    from api.services import create_sim_account, create_sim_order
+    s = _memory_session()
+    _, d0, days = _seed_journal_world(s, [0.20, 0.21, 0.26, 0.29])
+    a = create_sim_account(s, "自由", 100000.0)
+    create_sim_order(s, a.id, d0, d0 + timedelta(days=120), tpl_id="buy_straddle", qty=1)
+    run_sim_replay(s, d0, days[-1])
+    assert mis_trade_journal(s, d0, days[-1]) == []
+
+
+def test_api_sim_journal(client):
+    from datetime import date as _d
+    client.post("/api/sim/accounts", json={"name": "错单", "cash0": 50000.0})
+    client.post("/api/sim/orders", json={
+        "account_id": 1, "submit_date": str(DAYS[1]), "expiry": str(DAYS[-1]),
+        "tpl_id": "buy_straddle", "qty": 1})
+    client.post("/api/sim/replay", json={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    r = client.get("/api/sim/journal", params={
+        "from_date": str(DAYS[0]), "to_date": str(DAYS[5]), "threshold": 1e9})
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1                                      # 阈值极低 → 全部收录
+    assert "signal" in body[0] and "iv_story" in body[0] and "legs" in body[0]
+
+
 # ---------- API 端到端（注入内存库） ----------
 @pytest.fixture()
 def client(monkeypatch):

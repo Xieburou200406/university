@@ -716,3 +716,99 @@ def stream_sim_replay(session: Session, from_date: date, to_date: date,
         yield {"event": "day", "data": snap}
     out = _replay_persist(session, res, order_rows, sim_orders, from_date, to_date)
     yield {"event": "done", "data": out}
+
+
+# ---------------------------------------------------------------- 错单本（§12.4 游戏化复盘）
+MIS_TRADE_LOSS = -500.0     # 亏损阈值（元）：订单浮动盈亏低于此收录错单本
+
+
+def _intrinsic(spot: float, K: float, cp: str) -> float:
+    return max(spot - K, 0.0) if cp == "C" else max(K - spot, 0.0)
+
+
+def mis_trade_journal(session: Session, from_date: date, to_date: date,
+                      account_ids: list[int] | None = None,
+                      threshold: float = MIS_TRADE_LOSS) -> list[dict]:
+    """错单本（借鉴 qsquiz 错题本）：区间内浮动盈亏 ≤ threshold 的订单自动收录，
+    三段复盘：①当时信号怎么说 ②你做了什么 ③事后 IV 怎么走。
+    现算现审不落库——数据源唯一（sim_order/sim_fill/daily_metric/signal），永不过期失真。
+    订单级 pnl = 各腿当前市值(空头为负债) + 开仓现金流（与账户净值口径一致）。"""
+    from vol.sim.broker import option_px
+    q = (select(SimOrderDB).where(SimOrderDB.status == "filled",
+                                  SimOrderDB.submit_date >= from_date,
+                                  SimOrderDB.submit_date <= to_date)
+         .order_by(SimOrderDB.submit_date))
+    if account_ids:
+        q = q.where(SimOrderDB.account_id.in_(account_ids))
+    orders = session.execute(q).scalars().all()
+    if not orders:
+        return []
+
+    last_date, spot_now, iv_now = session.execute(
+        select(DailyMetric.date, DailyMetric.spot, DailyMetric.atm_iv)
+        .where(DailyMetric.date >= from_date, DailyMetric.date <= to_date)
+        .order_by(DailyMetric.date.desc()).limit(1)).one()
+
+    out: list[dict] = []
+    for o in orders:
+        legs = o.legs_json
+        fills = session.execute(select(SimFillDB)
+                                .where(SimFillDB.order_id == o.id)
+                                .order_by(SimFillDB.leg_index)).scalars().all()
+        if not fills:
+            continue
+        flow = 0.0                                    # 开仓现金流（买付卖收，含费用）
+        for f in fills:
+            leg = legs[min(f.leg_index, len(legs) - 1)]
+            signed = f.qty if leg["side"] == "buy" else -f.qty
+            flow += -signed * f.fill_px * pr.UNIT - f.cost
+        value = 0.0                                   # 各腿当前市值（空头为负）
+        for leg in legs:
+            signed = leg["qty"] if leg["side"] == "buy" else -leg["qty"]
+            K = float(leg["strike"])
+            if last_date >= o.expiry:                 # 已到期：内在价值结算口径
+                px = _intrinsic(spot_now, K, leg["cp"])
+            else:
+                T = max((o.expiry - last_date).days, 1) / 365.0
+                px = option_px(spot_now, K, T, iv_now, leg["cp"])
+            value += signed * px * pr.UNIT
+        pnl = round(value + flow, 2)
+        if pnl > threshold:
+            continue
+
+        # ① 当时信号怎么说（提交日信号 + 建议卡结论）
+        sig = session.execute(select(Signal).where(Signal.date == o.submit_date)
+                              .order_by(Signal.id.desc()).limit(1)).scalar_one_or_none()
+        if sig is not None:
+            card = session.execute(select(AdviceCard).where(AdviceCard.signal_id == sig.id)
+                                   .order_by(AdviceCard.id.desc()).limit(1)).scalar_one_or_none()
+            signal_txt = f"{sig.signal}（{sig.engine} 引擎，置信度 {sig.confidence}）"
+            if card is not None and card.card_json:
+                signal_txt += f" → 建议卡 {card.verdict_json.get('verdict') if card.verdict_json else '—'}：{card.card_json.get('action', '')[:60]}"
+        else:
+            signal_txt = "该日无信号记录（管线未跑或自由发挥）"
+
+        # ③ 事后 IV 怎么走
+        entry = session.execute(select(DailyMetric.spot, DailyMetric.atm_iv)
+                                .where(DailyMetric.date == o.submit_date)).one_or_none()
+        iv_then = entry[1] if entry else None
+        spot_then = entry[0] if entry else None
+        iv_txt = (f"IV {iv_then*100:.2f}% → {iv_now*100:.2f}%"
+                  f"（{(iv_now - iv_then)*100:+.2f} 个点）" if iv_then is not None
+                  else f"期末 IV {iv_now*100:.2f}%（期初缺失）")
+        iv_txt += f"；标的 {spot_then} → {spot_now}" if spot_then is not None else ""
+        if o.expiry <= last_date:
+            iv_txt += f"；持仓已到期（{o.expiry}），按内在价值结算"
+
+        out.append({
+            "order_id": o.id, "account_id": o.account_id, "submit_date": str(o.submit_date),
+            "expiry": str(o.expiry), "pnl": pnl, "tpl_id": o.tpl_id,
+            "legs": legs, "fills": [{"leg_index": f.leg_index, "fill_px": f.fill_px,
+                                     "qty": f.qty, "cost": f.cost,
+                                     "filled_date": str(f.filled_date)} for f in fills],
+            "signal": signal_txt,
+            "iv_story": iv_txt,
+            "threshold": threshold,
+        })
+    _safe_log("S", "mis_trade", {"count": len(out), "range": f"{from_date}~{to_date}"})
+    return out

@@ -116,4 +116,17 @@ def router() -> APIRouter:
                  "cp": x.cp, "strike": x.strike, "side": x.side, "qty": x.qty,
                  "fill_px": x.fill_px, "cost": x.cost} for x in rows]
 
+    @r.get("/sim/journal")
+    def journal(from_date: date, to_date: date, threshold: float = -500.0,
+                account_ids: str | None = None, db: Session = Depends(get_db)):
+        """错单本（§12.4）：亏损超阈值的订单自动收录，三段复盘。"""
+        from api.services import mis_trade_journal
+        ids = None
+        if account_ids:
+            try:
+                ids = [int(x) for x in account_ids.split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(422, "account_ids 须为逗号分隔的整数")
+        return mis_trade_journal(db, from_date, to_date, ids, threshold)
+
     return r

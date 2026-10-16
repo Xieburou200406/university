@@ -677,7 +677,47 @@ with tab6:
                 "id": "回报ID", "account_id": "账户", "filled_date": "成交日", "cp": "类型",
                 "strike": "行权价", "side": "方向", "qty": "张数",
                 "fill_px": "成交价", "cost": "费用(元)"}), use_container_width=True, height=200)
-        st.caption("⏳ 待接入：SSE 流式回放（§12.5）、错单本（亏损超阈自动收录三段复盘）、"
-                   "归因瀑布抽屉。真实数据回放需日线任务累积 ≥2 个交易截面。")
+        # ---- 错单本（§12.4 游戏化复盘，借鉴 qsquiz 错题本） ----
+        st.divider()
+        st.markdown("**错单本** —— 亏损超过阈值的订单自动收录，三段复盘")
+        j1, j2, j3 = st.columns([1, 1, 2])
+        _j_from = j1.date_input("起", value=pd.Timestamp(_panel_min).date() if _panel_min else None,
+                                key="sim_j_from")
+        _j_to = j2.date_input("止", value=pd.Timestamp(_panel_max).date() if _panel_max else None,
+                              key="sim_j_to")
+        _j_thr = j3.number_input("亏损阈值（元，≤此值收录）", value=-500.0, step=100.0,
+                                 key="sim_j_thr")
+        if st.button("📖 翻错单本", use_container_width=True, key="sim_j_btn"):
+            s = _sim_session()
+            try:
+                from api.services import mis_trade_journal
+                entries = mis_trade_journal(s, _j_from, _j_to, None, float(_j_thr))
+                s.close()
+            except Exception as e:                         # noqa: BLE001
+                s.close()
+                entries = []
+                st.error(f"错单本读取失败：{e}")
+            if not entries:
+                st.success("该区间无错单（没有订单亏损超过阈值）——保持纪律，继续")
+            else:
+                st.warning(f"共 {len(entries)} 笔错单（阈值 {_j_thr:,.0f} 元）——错题本模式："
+                           f"重点看'事后 IV 怎么走'与你的入场理由是否自洽")
+                for e in entries:
+                    _legs_txt = " + ".join(
+                        f"{'买' if l['side'] == 'buy' else '卖'}{l['qty']}张 "
+                        f"{l['cp']}@{l['strike']}" for l in e["legs"])
+                    with st.expander(
+                            f"🔴 订单#{e['order_id']} · {e['submit_date']} 建仓 · "
+                            f"浮动盈亏 {e['pnl']:+,.0f} 元 · {_legs_txt}"):
+                        st.markdown(f"**① 当时信号怎么说**：{e['signal']}")
+                        st.markdown(f"**② 你做了什么**：{_legs_txt}，到期 {e['expiry']}，"
+                                    f"成交回报 {len(e['fills'])} 条"
+                                    f"（模板 {e['tpl_id'] or '自由下单'}）")
+                        st.markdown(f"**③ 事后 IV 怎么走**：{e['iv_story']}")
+                        st.caption("错单不是批评——是把学费变成经验：对照①③检查入场逻辑"
+                                   "是'信号如此'还是'逆信号操作'，下次同类情景怎么办。")
+
+        st.caption("⏳ 待接入：归因瀑布复盘抽屉、GET /api/sim/compare 多账户对比报告。"
+                   "真实数据回放需日线任务累积 ≥2 个交易截面。")
     except Exception as e:                                 # noqa: BLE001 —— 模拟盘故障不阻断其他 Tab
         st.warning(f"模拟盘模块未就绪（{type(e).__name__}: {e}）——检查 sim 表是否已迁移（alembic upgrade head）")
