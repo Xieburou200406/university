@@ -185,3 +185,145 @@ def test_api_sim_info_wall_404(client):
         "account_id": 1, "submit_date": "2030-01-01", "expiry": "2030-02-01",
         "legs": [{"cp": "C", "strike": 2.9, "side": "buy", "qty": 1}]})
     assert r.status_code == 404 and "信息墙" in r.json()["detail"]
+
+
+# ---------- M6-② 自动镜像（跟随建议账户） ----------
+def _memory_session():
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+    from db.session import make_session
+    from db.models import Base
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    SM, _ = make_session(eng)
+    return SM()
+
+
+def _seed_mirror_world(s, n_days=4, signal="LONG_VOL"):
+    """今日起 n 个连续日的截面 + auto_mirror 账户 + 信号。返回 (sig, d0, days)。"""
+    from db.models import DailyMetric, Signal
+    from db.models import SimAccount as SimAccountDB
+    d0 = date.today()
+    days = [d0 + timedelta(days=i) for i in range(n_days)]
+    for i, dt in enumerate(days):
+        s.add(DailyMetric(date=dt, spot=2.9 + 0.005 * i, atm_iv=0.20 + 0.001 * i,
+                          iv_pct_40=0.5))
+    s.add(SimAccountDB(name="跟随建议", auto_mirror=True, cash0=100000.0))
+    s.commit()
+    sig = Signal(date=d0, engine="percentile", signal=signal, confidence=0.9,
+                 valid_until=d0 + timedelta(days=1), detail_json={"iv_pct": 0.8})
+    s.add(sig)
+    s.commit()
+    return sig, d0, days
+
+
+def test_mirror_expiry_picks_monthly_wednesday():
+    from vol.sim.mirror import mirror_expiry
+    # 2026-10-16 + 14 天 = 10-30 之后最近的第四个星期三 → 2026-11-25
+    assert mirror_expiry(date(2026, 10, 16)) == date(2026, 11, 25)
+    assert mirror_expiry(date(2026, 10, 16)).weekday() == 2     # 周三
+
+
+def test_mirror_long_vol_creates_buy_straddle_and_dedupes():
+    from api.services import generate_advice
+    from vol.config import Settings
+    from vol.sim.mirror import mirror_advice
+    s = _memory_session()
+    sig, d0, _ = _seed_mirror_world(s, signal="LONG_VOL")
+    card = generate_advice(s, Settings(), sig.id)
+    assert card.verdict_json["verdict"] == "PASS"
+    orders = s.execute(__import__("sqlalchemy", fromlist=["select"]).select(
+        __import__("db.models", fromlist=["SimOrder"]).SimOrder)).scalars().all()
+    assert len(orders) == 1
+    o = orders[0]
+    assert o.tpl_id == "auto:long_vol" and o.status == "pending"
+    assert o.submit_date == d0
+    assert (o.params_json or {}).get("signal_id") == sig.id
+    legs = o.legs_json
+    assert {l["cp"] for l in legs} == {"C", "P"} and all(l["side"] == "buy" for l in legs)
+    assert all(l["strike"] == round_strike(2.9) for l in legs)   # ATM
+    assert 1 <= legs[0]["qty"] <= 20
+    # 卡面写回镜像信息
+    assert card.card_json["auto_mirror"]["orders"][0]["order_id"] == o.id
+    # 去重：重复生成同一信号的建议 → 不重复建仓
+    card2 = generate_advice(s, Settings(), sig.id)
+    orders2 = s.execute(__import__("sqlalchemy", fromlist=["select"]).select(
+        __import__("db.models", fromlist=["SimOrder"]).SimOrder)).scalars().all()
+    assert len(orders2) == 1 and card2.card_json.get("auto_mirror") is None
+
+
+def test_mirror_short_vol_creates_sell_strangle():
+    from api.services import generate_advice
+    from vol.config import Settings
+    s = _memory_session()
+    sig, _, _ = _seed_mirror_world(s, signal="SHORT_VOL")
+    card = generate_advice(s, Settings(), sig.id)
+    from sqlalchemy import select
+    from db.models import SimOrder as SimOrderDB
+    o = s.execute(select(SimOrderDB)).scalar_one()
+    assert o.tpl_id == "auto:short_vol"
+    legs = o.legs_json
+    assert {l["cp"] for l in legs} == {"C", "P"} and all(l["side"] == "sell" for l in legs)
+    assert legs[0]["strike"] > 2.9 > legs[1]["strike"]           # 虚值两翼
+    assert card.verdict_json["verdict"] == "PASS"
+
+
+def test_mirror_skips_reject_and_neutral():
+    from api.services import generate_advice
+    from vol.config import Settings
+    from sqlalchemy import select
+    from db.models import SimOrder as SimOrderDB
+    # REJECT：valid_until 已过 → 建议作废，不镜像
+    s = _memory_session()
+    sig, _, _ = _seed_mirror_world(s, signal="LONG_VOL")
+    sig.valid_until = date.today() - timedelta(days=1)
+    sig.date = date.today() - timedelta(days=2)
+    s.commit()
+    card = generate_advice(s, Settings(), sig.id)
+    assert card.verdict_json["verdict"] == "REJECT"
+    assert s.execute(select(SimOrderDB)).scalars().all() == []
+    # NEUTRAL：观望也是建议，但不建仓
+    s2 = _memory_session()
+    sig2, _, _ = _seed_mirror_world(s2, signal="NEUTRAL")
+    card2 = generate_advice(s2, Settings(), sig2.id)
+    assert card2.verdict_json["verdict"] == "PASS"
+    assert s2.execute(select(SimOrderDB)).scalars().all() == []
+
+
+def test_mirror_no_mirror_account_is_noop():
+    from api.services import generate_advice
+    from vol.config import Settings
+    from sqlalchemy import select
+    from db.models import DailyMetric, Signal
+    from db.models import SimAccount as SimAccountDB
+    from db.models import SimOrder as SimOrderDB
+    s = _memory_session()
+    d0 = date.today()
+    s.add(DailyMetric(date=d0, spot=2.9, atm_iv=0.2, iv_pct_40=0.5))
+    s.add(SimAccountDB(name="自由账户", auto_mirror=False, cash0=50000.0))   # 非镜像账户
+    s.commit()
+    sig = Signal(date=d0, engine="percentile", signal="LONG_VOL", confidence=0.9,
+                 valid_until=d0 + timedelta(days=1))
+    s.add(sig)
+    s.commit()
+    generate_advice(s, Settings(), sig.id)
+    assert s.execute(select(SimOrderDB)).scalars().all() == []
+
+
+def test_mirror_order_fills_in_replay():
+    """端到端：建议卡镜像 → 回放撮合成交 → 净值打点。"""
+    from api.services import generate_advice, run_sim_replay
+    from vol.config import Settings
+    s = _memory_session()
+    sig, d0, days = _seed_mirror_world(s, n_days=4, signal="LONG_VOL")
+    generate_advice(s, Settings(), sig.id)
+    res = run_sim_replay(s, d0, days[-1])
+    assert res["days"] == 4
+    assert res["fills"], "镜像单应在首个虚拟日成交"
+    assert all(f["side"] == "buy" for f in res["fills"])
+    assert len(res["fills"]) == 2                                # 跨式两腿
+    from sqlalchemy import select
+    from db.models import SimNav as SimNavDB
+    navs = s.execute(select(SimNavDB)).scalars().all()
+    assert len(navs) == 4                                        # 逐日打点

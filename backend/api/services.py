@@ -184,6 +184,15 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
     session.flush()
     _safe_log("A", "advice", {"card": ac.id, "verdict": verdict, "signal": sig.signal,
                               "valid_until": str(sig.valid_until)})
+
+    # M6-②：跟随建议账户自动镜像（稳健档挂单），结果写回卡面（失败只记日志不影响卡）
+    from vol.sim.mirror import mirror_advice
+    mirrored = mirror_advice(session, ac, sig)
+    if mirrored:
+        card["auto_mirror"] = {"orders": [{"account_id": o.account_id, "order_id": o.id,
+                                           "qty": o.legs_json[0].get("qty"),
+                                           "expiry": str(o.expiry)} for o in mirrored]}
+        ac.card_json = card
     return ac
 
 
