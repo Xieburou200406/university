@@ -717,7 +717,68 @@ with tab6:
                         st.caption("错单不是批评——是把学费变成经验：对照①③检查入场逻辑"
                                    "是'信号如此'还是'逆信号操作'，下次同类情景怎么办。")
 
-        st.caption("⏳ 待接入：归因瀑布复盘抽屉、GET /api/sim/compare 多账户对比报告。"
+        # ---- 对比报告 + 归因瀑布（§12.4 复盘报告抽屉） ----
+        st.divider()
+        st.markdown("**对比报告 & 归因瀑布** —— 跟建议 vs 自由 vs 买入持有")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        _c_from = c1.date_input("起", value=pd.Timestamp(_panel_min).date() if _panel_min else None,
+                                key="sim_c_from")
+        _c_to = c2.date_input("止", value=pd.Timestamp(_panel_max).date() if _panel_max else None,
+                              key="sim_c_to")
+        if c3.button("📊 生成对比报告", use_container_width=True, key="sim_c_btn"):
+            s = _sim_session()
+            try:
+                from api.services import sim_compare, sim_waterfall
+                rep = sim_compare(s, _c_from, _c_to)
+                s.close()
+                if rep["accounts"]:
+                    st.dataframe(pd.DataFrame([
+                        {"账户": f"{r['name']}" + ("（跟随建议）" if r["auto_mirror"] else ""),
+                         "初始资金": f"{r['cash0']:,.0f}", "期末净值": f"{r['final_nav']:,.0f}",
+                         "盈亏": f"{r['return']:+,.0f}", "收益率": f"{r['return_pct']:+.2f}%",
+                         "最大回撤": f"{r['max_drawdown']:,.0f}", "天数": r["days"]}
+                        for r in rep["accounts"]]), use_container_width=True, height=160)
+                    st.caption(f"基准（{rep['benchmark']['name']}）："
+                               f"{rep['benchmark']['return_pct']:+.2f}% —— "
+                               f"红涨绿跌：跑赢基准记正贡献")
+                else:
+                    st.info("区间内无账户净值（先运行回放）")
+                # 归因瀑布（每账户一个 expander）
+                s2 = _sim_session()
+                for r in rep.get("accounts", []):
+                    try:
+                        wf = sim_waterfall(s2, r["account_id"], _c_from, _c_to)
+                    except Exception:                      # noqa: BLE001
+                        continue
+                    with st.expander(f"🪜 {wf['name']} 归因瀑布（截至 {wf['asof']}）"
+                                     + ("" if wf["identity_ok"] else " ⚠️ 恒等式不闭合")):
+                        _steps = wf["steps"]
+                        _wf = go.Waterfall(
+                            x=[s_["label"] for s_ in _steps],
+                            y=[s_["delta"] for s_ in _steps],
+                            measure=["absolute"] + ["relative"] * (len(_steps) - 2) + ["total"],
+                            increasing=dict(marker=dict(color="#A32D2D")),   # 红涨
+                            decreasing=dict(marker=dict(color="#3B6D11")),   # 绿跌
+                            totals=dict(marker=dict(color="#185FA5")),
+                            text=[f"{s_['delta']:+,.0f}" if s_["kind"] == "order"
+                                  else f"{s_['delta']:,.0f}" for s_ in _steps],
+                            textposition="outside")
+                        _fg = go.Figure(_wf)
+                        _fg.update_layout(title=f"{wf['name']}：起始资金 → 逐订单盈亏 → 期末净值",
+                                          template="plotly_white", height=360,
+                                          yaxis_title="金额（元）")
+                        st.plotly_chart(_fg, use_container_width=True)
+                        st.caption("口径：期末净值 = 起始资金 + Σ订单盈亏（恒等式，分毫不差）；"
+                                   "每根柱 = 一笔订单的浮动盈亏（市值 + 开仓现金流）")
+                s2.close()
+            except RuntimeError as e:
+                s.close()
+                st.error(f"❌ {e}")
+            except Exception as e:                         # noqa: BLE001
+                s.close()
+                st.error(f"对比报告失败：{e}")
+
+        st.caption("⏳ M6 模拟盘全部落地：账户/镜像下单/回放/步进/错单本/对比报告/归因瀑布。"
                    "真实数据回放需日线任务累积 ≥2 个交易截面。")
     except Exception as e:                                 # noqa: BLE001 —— 模拟盘故障不阻断其他 Tab
         st.warning(f"模拟盘模块未就绪（{type(e).__name__}: {e}）——检查 sim 表是否已迁移（alembic upgrade head）")

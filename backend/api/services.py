@@ -726,13 +726,12 @@ def _intrinsic(spot: float, K: float, cp: str) -> float:
     return max(spot - K, 0.0) if cp == "C" else max(K - spot, 0.0)
 
 
-def mis_trade_journal(session: Session, from_date: date, to_date: date,
-                      account_ids: list[int] | None = None,
-                      threshold: float = MIS_TRADE_LOSS) -> list[dict]:
-    """错单本（借鉴 qsquiz 错题本）：区间内浮动盈亏 ≤ threshold 的订单自动收录，
-    三段复盘：①当时信号怎么说 ②你做了什么 ③事后 IV 怎么走。
-    现算现审不落库——数据源唯一（sim_order/sim_fill/daily_metric/signal），永不过期失真。
-    订单级 pnl = 各腿当前市值(空头为负债) + 开仓现金流（与账户净值口径一致）。"""
+def _order_pnl_rows(session: Session, from_date: date, to_date: date,
+                    account_ids: list[int] | None = None) -> tuple[list[dict], date, float, float]:
+    """区间内全部已成交订单的盈亏明细（错单本/归因瀑布共用，唯一实现）。
+    订单级 pnl = 各腿当前市值(空头为负债) + 开仓现金流（含费用）——
+    恒等式：期末净值 = 起始资金 + Σ订单pnl（区间内成交订单口径，瀑布图分毫不差的依据）。
+    返回 (rows, last_date, spot_now, iv_now)。"""
     from vol.sim.broker import option_px
     q = (select(SimOrderDB).where(SimOrderDB.status == "filled",
                                   SimOrderDB.submit_date >= from_date,
@@ -741,15 +740,13 @@ def mis_trade_journal(session: Session, from_date: date, to_date: date,
     if account_ids:
         q = q.where(SimOrderDB.account_id.in_(account_ids))
     orders = session.execute(q).scalars().all()
-    if not orders:
-        return []
 
     last_date, spot_now, iv_now = session.execute(
         select(DailyMetric.date, DailyMetric.spot, DailyMetric.atm_iv)
         .where(DailyMetric.date >= from_date, DailyMetric.date <= to_date)
         .order_by(DailyMetric.date.desc()).limit(1)).one()
 
-    out: list[dict] = []
+    rows: list[dict] = []
     for o in orders:
         legs = o.legs_json
         fills = session.execute(select(SimFillDB)
@@ -772,12 +769,34 @@ def mis_trade_journal(session: Session, from_date: date, to_date: date,
                 T = max((o.expiry - last_date).days, 1) / 365.0
                 px = option_px(spot_now, K, T, iv_now, leg["cp"])
             value += signed * px * pr.UNIT
-        pnl = round(value + flow, 2)
-        if pnl > threshold:
+        rows.append({
+            "order_id": o.id, "account_id": o.account_id,
+            "submit_date": str(o.submit_date), "expiry": str(o.expiry),
+            "tpl_id": o.tpl_id, "legs": legs,
+            "fills": [{"leg_index": f.leg_index, "fill_px": f.fill_px, "qty": f.qty,
+                       "cost": f.cost, "filled_date": str(f.filled_date)} for f in fills],
+            "pnl": round(value + flow, 2),
+        })
+    return rows, last_date, spot_now, iv_now
+
+
+def mis_trade_journal(session: Session, from_date: date, to_date: date,
+                      account_ids: list[int] | None = None,
+                      threshold: float = MIS_TRADE_LOSS) -> list[dict]:
+    """错单本（借鉴 qsquiz 错题本）：区间内浮动盈亏 ≤ threshold 的订单自动收录，
+    三段复盘：①当时信号怎么说 ②你做了什么 ③事后 IV 怎么走。
+    现算现审不落库——数据源唯一（sim_order/sim_fill/daily_metric/signal），永不过期失真。"""
+    rows, last_date, spot_now, iv_now = _order_pnl_rows(session, from_date, to_date, account_ids)
+
+    out: list[dict] = []
+    for r in rows:
+        if r["pnl"] > threshold:
             continue
+        o_id, o_submit, o_expiry = r["order_id"], date.fromisoformat(r["submit_date"]), \
+            date.fromisoformat(r["expiry"])
 
         # ① 当时信号怎么说（提交日信号 + 建议卡结论）
-        sig = session.execute(select(Signal).where(Signal.date == o.submit_date)
+        sig = session.execute(select(Signal).where(Signal.date == o_submit)
                               .order_by(Signal.id.desc()).limit(1)).scalar_one_or_none()
         if sig is not None:
             card = session.execute(select(AdviceCard).where(AdviceCard.signal_id == sig.id)
@@ -790,25 +809,91 @@ def mis_trade_journal(session: Session, from_date: date, to_date: date,
 
         # ③ 事后 IV 怎么走
         entry = session.execute(select(DailyMetric.spot, DailyMetric.atm_iv)
-                                .where(DailyMetric.date == o.submit_date)).one_or_none()
+                                .where(DailyMetric.date == o_submit)).one_or_none()
         iv_then = entry[1] if entry else None
         spot_then = entry[0] if entry else None
         iv_txt = (f"IV {iv_then*100:.2f}% → {iv_now*100:.2f}%"
                   f"（{(iv_now - iv_then)*100:+.2f} 个点）" if iv_then is not None
                   else f"期末 IV {iv_now*100:.2f}%（期初缺失）")
         iv_txt += f"；标的 {spot_then} → {spot_now}" if spot_then is not None else ""
-        if o.expiry <= last_date:
-            iv_txt += f"；持仓已到期（{o.expiry}），按内在价值结算"
+        if o_expiry <= last_date:
+            iv_txt += f"；持仓已到期（{o_expiry}），按内在价值结算"
 
         out.append({
-            "order_id": o.id, "account_id": o.account_id, "submit_date": str(o.submit_date),
-            "expiry": str(o.expiry), "pnl": pnl, "tpl_id": o.tpl_id,
-            "legs": legs, "fills": [{"leg_index": f.leg_index, "fill_px": f.fill_px,
-                                     "qty": f.qty, "cost": f.cost,
-                                     "filled_date": str(f.filled_date)} for f in fills],
+            "order_id": o_id, "account_id": r["account_id"],
+            "submit_date": r["submit_date"], "expiry": r["expiry"],
+            "pnl": r["pnl"], "tpl_id": r["tpl_id"], "legs": r["legs"], "fills": r["fills"],
             "signal": signal_txt,
             "iv_story": iv_txt,
             "threshold": threshold,
         })
     _safe_log("S", "mis_trade", {"count": len(out), "range": f"{from_date}~{to_date}"})
     return out
+
+
+def sim_compare(session: Session, from_date: date, to_date: date,
+                account_ids: list[int] | None = None) -> dict:
+    """多账户对比报告（§12.2 CompareReport：跟建议 vs 自由 vs 买入持有）。
+    指标：期末净值 / 收益率 / 最大回撤（nav 序列口径）；基准=买入持有标的（1 万元归一）。"""
+    q = select(SimAccountDB)
+    if account_ids:
+        q = q.where(SimAccountDB.id.in_(account_ids))
+    accts = session.execute(q.order_by(SimAccountDB.id)).scalars().all()
+
+    spots = session.execute(select(DailyMetric.date, DailyMetric.spot)
+                            .where(DailyMetric.date >= from_date, DailyMetric.date <= to_date)
+                            .order_by(DailyMetric.date)).all()
+    if not spots:
+        raise RuntimeError("区间内无行情截面（fail-closed）")
+    spot0 = spots[0][1]
+    bench_curve = [[str(d), round(10000.0 * s / spot0, 2)] for d, s in spots]
+
+    rows = []
+    for a in accts:
+        navs = session.execute(
+            select(SimNavDB.ts, SimNavDB.nav)
+            .where(SimNavDB.account_id == a.id,
+                   SimNavDB.ts >= from_date, SimNavDB.ts <= to_date)
+            .order_by(SimNavDB.ts)).all()
+        if not navs:
+            continue
+        curve = [(ts, nav) for ts, nav in navs]
+        peak, mdd = curve[0][1], 0.0
+        for _, nav in curve:
+            peak = max(peak, nav)
+            mdd = min(mdd, nav - peak)
+        ret = curve[-1][1] - a.cash0
+        rows.append({
+            "account_id": a.id, "name": a.name, "auto_mirror": a.auto_mirror,
+            "cash0": a.cash0, "final_nav": curve[-1][1],
+            "return": round(ret, 2), "return_pct": round(ret / a.cash0 * 100, 2),
+            "max_drawdown": round(mdd, 2), "days": len(curve),
+            "curve": [[str(ts), nav] for ts, nav in curve],
+        })
+    _safe_log("S", "sim_compare", {"accounts": len(rows), "range": f"{from_date}~{to_date}"})
+    return {"benchmark": {"name": "买入持有标的(1万)", "curve": bench_curve,
+                          "return_pct": round((spots[-1][1] / spot0 - 1) * 100, 2)},
+            "accounts": rows}
+
+
+def sim_waterfall(session: Session, account_id: int, from_date: date, to_date: date) -> dict:
+    """单账户归因瀑布（§12.4 复盘报告抽屉）：起始资金 → 逐订单盈亏 → 期末净值。
+    恒等式口径（_order_pnl_rows）：Σ订单pnl = 期末净值 - 起始资金，瀑布分毫不差。"""
+    a = session.get(SimAccountDB, account_id)
+    if a is None:
+        raise LookupError(f"sim_account {account_id} 不存在")
+    rows, last_date, _, _ = _order_pnl_rows(session, from_date, to_date, [account_id])
+    nav_last = session.execute(select(SimNavDB.nav)
+                               .where(SimNavDB.account_id == account_id,
+                                      SimNavDB.ts >= from_date, SimNavDB.ts <= to_date)
+                               .order_by(SimNavDB.ts.desc()).limit(1)).scalar_one_or_none()
+    steps = [{"label": "起始资金", "delta": a.cash0, "kind": "total"}]
+    for r in rows:
+        steps.append({"label": f"#{r['order_id']} {r['submit_date'][5:]} "
+                               f"{(r['tpl_id'] or '自由')}",
+                      "delta": r["pnl"], "kind": "order", "order_id": r["order_id"]})
+    end = nav_last if nav_last is not None else a.cash0 + sum(r["pnl"] for r in rows)
+    steps.append({"label": "期末净值", "delta": round(end, 2), "kind": "total"})
+    return {"account_id": account_id, "name": a.name, "asof": str(last_date),
+            "steps": steps,
+            "identity_ok": abs(sum(r["pnl"] for r in rows) + a.cash0 - end) < 0.05}

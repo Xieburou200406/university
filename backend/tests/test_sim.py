@@ -245,6 +245,53 @@ def test_api_sim_journal(client):
     assert "signal" in body[0] and "iv_story" in body[0] and "legs" in body[0]
 
 
+# ---------- 对比报告 + 归因瀑布（M6 尾巴） ----------
+def test_sim_compare_and_waterfall_identity():
+    """compare 出三账户指标；瀑布恒等式：起始资金 + Σ订单pnl = 期末净值（分毫不差）。"""
+    from api.services import (create_sim_account, create_sim_order,
+                              run_sim_replay, sim_compare, sim_waterfall)
+    s = _memory_session()
+    sig, d0, days = _seed_journal_world(s, [0.20, 0.21, 0.26, 0.29])
+    a1 = create_sim_account(s, "跟随建议", 100000.0, auto_mirror=True)
+    a2 = create_sim_account(s, "自由", 100000.0)
+    create_sim_order(s, a2.id, d0, d0 + timedelta(days=120), tpl_id="buy_straddle", qty=2)
+    run_sim_replay(s, d0, days[-1])
+
+    rep = sim_compare(s, d0, days[-1])
+    names = {r["name"] for r in rep["accounts"]}
+    assert names == {"跟随建议", "自由"}
+    for r in rep["accounts"]:
+        assert r["days"] == 4 and r["final_nav"] > 0
+        assert r["return"] == pytest.approx(r["final_nav"] - r["cash0"], abs=0.01)
+    assert rep["benchmark"]["return_pct"] == 0.0               # spot 平走 → 基准 0%
+
+    wf = sim_waterfall(s, a2.id, d0, days[-1])
+    assert wf["identity_ok"] is True                            # 恒等式成立
+    assert wf["steps"][0]["label"] == "起始资金"
+    assert wf["steps"][-1]["label"] == "期末净值"
+    _orders = [st for st in wf["steps"] if st["kind"] == "order"]
+    assert len(_orders) == 1 and _orders[0]["delta"] == pytest.approx(
+        wf["steps"][-1]["delta"] - wf["steps"][0]["delta"], abs=0.05)
+
+
+def test_api_sim_compare_waterfall(client):
+    client.post("/api/sim/accounts", json={"name": "对比", "cash0": 60000.0})
+    client.post("/api/sim/orders", json={
+        "account_id": 1, "submit_date": str(DAYS[1]), "expiry": str(DAYS[-1]),
+        "tpl_id": "buy_straddle", "qty": 1})
+    client.post("/api/sim/replay", json={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    r = client.get("/api/sim/compare", params={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["accounts"][0]["name"] == "对比" and len(body["benchmark"]["curve"]) == 6
+    r = client.get("/api/sim/accounts/1/waterfall",
+                   params={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    assert r.status_code == 200 and r.json()["identity_ok"] is True
+    r = client.get("/api/sim/accounts/99/waterfall",
+                   params={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
+    assert r.status_code == 404
+
+
 # ---------- API 端到端（注入内存库） ----------
 @pytest.fixture()
 def client(monkeypatch):

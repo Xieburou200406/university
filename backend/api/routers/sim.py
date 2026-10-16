@@ -129,4 +129,30 @@ def router() -> APIRouter:
                 raise HTTPException(422, "account_ids 须为逗号分隔的整数")
         return mis_trade_journal(db, from_date, to_date, ids, threshold)
 
+    @r.get("/sim/compare")
+    def compare(from_date: date, to_date: date, account_ids: str | None = None,
+                db: Session = Depends(get_db)):
+        """多账户对比报告（§12.2 CompareReport）：跟建议 vs 自由 vs 买入持有。"""
+        from api.services import sim_compare
+        ids = None
+        if account_ids:
+            try:
+                ids = [int(x) for x in account_ids.split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(422, "account_ids 须为逗号分隔的整数")
+        try:
+            return sim_compare(db, from_date, to_date, ids)
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+
+    @r.get("/sim/accounts/{aid}/waterfall")
+    def waterfall(aid: int, from_date: date, to_date: date,
+                  db: Session = Depends(get_db)):
+        """单账户归因瀑布（§12.4 复盘抽屉）：起始资金 → 逐订单盈亏 → 期末净值。"""
+        from api.services import sim_waterfall
+        try:
+            return sim_waterfall(db, aid, from_date, to_date)
+        except LookupError as e:
+            raise HTTPException(404, str(e))
+
     return r
