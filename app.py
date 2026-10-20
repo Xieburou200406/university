@@ -237,6 +237,24 @@ with tab1:
     hist.update_layout(title=f"ATM IV 历史（{len(df)} 交易日）", template="plotly_white", height=340)
     st.plotly_chart(hist, use_container_width=True)
 
+    # ---- M7-⑦ 档位标注 + 推荐执行载体（§7：偏离 >2 个 IV 点高亮） ----
+    st.subheader("近月合约档位与载体")
+    from vol.pricing.liquidity import tier_of
+    tb = near[["code", "sym", "strike", "cp", "delta", "iv"]].copy()
+    tb["dev_bp"] = near["dev_bp"].values
+    tb["档位"] = [tier_of(k, F, c) for k, c in zip(tb["strike"], tb["cp"])]
+    tb["偏移档数"] = ((tb["strike"] / F - 1.0) / 0.025).round(1)   # 510050 档距 0.025 元
+    tb["IV%"] = (tb["iv"] * 100).round(2)
+    tb["偏离bp"] = tb["dev_bp"].round(0)
+    tb["载体"] = np.where(tb["dev_bp"].abs() > 200, "⭐ 推荐执行载体", "")
+    tb = tb.sort_values(["strike", "cp"])
+    _only_carrier = st.checkbox("只看推荐执行载体（|偏离| > 2 个 IV 点）", key="tb1_carrier_only")
+    _show = tb[tb["载体"] != ""] if _only_carrier else tb
+    st.dataframe(_show[["code", "sym", "cp", "strike", "档位", "偏移档数", "delta", "IV%", "偏离bp", "载体"]],
+                 use_container_width=True, height=360, hide_index=True)
+    st.caption("档位口径：|K/F−1|<2% = ATM；偏移档数按档距 0.025 元折算；delta 为交易所官方口径。"
+               "⭐ = 收盘 IV 显著偏离拟合曲线（>2 个 IV 点）的合约——偏离是机会也是陷阱，执行前核对盘口。")
+
 # ---------- Tab2 信号台 ----------
 
 with tab2:
@@ -444,6 +462,80 @@ with tab3:
 # ---------- Tab4 归因 ----------
 
 with tab4:
+    # ---- M7-⑦ 真实持仓管理：面板直连账本（API POST /positions + /close 的同库直写形态） ----
+    st.subheader("真实持仓管理")
+    st.caption("直连正式库 position 表；合约代码必须可解析（如 510050C2611M02900），否则风控链/快照/到期提醒全部失效——录入前强校验。")
+    try:
+        from db.session import make_engine as _mk_eng, make_session as _mk_ses
+        from db.models import Position as _PosDB
+        from sqlalchemy import select as _sel, func as _fn2
+        from vol.contracts import parse_contract_code as _parse
+
+        def _pos_session():
+            _M, _ = _mk_ses(_mk_eng(f"sqlite:///{DB_PATH}"))
+            return _M()
+
+        _ps = _pos_session()
+        _opens = _ps.execute(_sel(_PosDB).where(_fn2.upper(_PosDB.status) == "OPEN")
+                             .order_by(_PosDB.id)).scalars().all()
+        _c1, _c2 = st.columns(2)
+        with _c1.form("pos_new", border=True):
+            st.markdown("**➕ 录入持仓**")
+            _code = st.text_input("合约代码", value="", key="pos_code",
+                                  help="格式如 510050C2611M02900（行权价=末4-5位÷1000，铁律 1）")
+            _qty = st.number_input("张数（正=多头，负=空头）", min_value=-100, max_value=100,
+                                   value=1, step=1, key="pos_qty")
+            _odate = st.date_input("开仓日", value=None, key="pos_odate")
+            _opx = st.number_input("开仓价（元/张）", min_value=0.0001, value=0.0600,
+                                   step=0.0001, format="%.4f", key="pos_opx")
+            _note = st.text_input("备注（可选）", value="", key="pos_note")
+            if st.form_submit_button("录入", use_container_width=True):
+                _ok = True
+                try:
+                    _parse(_code.strip())
+                except ValueError as ve:
+                    st.error(f"合约代码不可解析，拒绝录入：{ve}")
+                    _ok = False
+                if _ok and (_qty == 0 or _odate is None):
+                    st.error("张数不能为 0，且必须填写开仓日。")
+                    _ok = False
+                if _ok:
+                    _ps.add(_PosDB(code=_code.strip(), qty=int(_qty), open_date=_odate,
+                                   open_px=float(_opx), status="open", note=_note.strip() or None))
+                    _ps.commit()
+                    st.success(f"已录入：{_code.strip()} × {_qty} 张")
+                    st.rerun()
+        with _c2.form("pos_close", border=True):
+            st.markdown("**➖ 平仓**")
+            if _opens:
+                _opt = {f"#{p.id} {p.code} ×{p.qty}（开仓 {p.open_date}）": p for p in _opens}
+                _pick = st.selectbox("选择 OPEN 持仓", list(_opt), key="pos_pick")
+                _cpx = st.number_input("平仓价（元/张）", min_value=0.0001, value=0.0600,
+                                       step=0.0001, format="%.4f", key="pos_cpx")
+                _cdate = st.date_input("平仓日", value=None, key="pos_cdate")
+                if st.form_submit_button("确认平仓", use_container_width=True):
+                    _p = _opt[_pick]
+                    if _cdate is None:
+                        st.error("必须填写平仓日。")
+                    else:
+                        _p.status, _p.close_date, _p.close_px = "closed", _cdate, float(_cpx)
+                        _ps.commit()
+                        st.success(f"已平仓 #{_p.id} {_p.code}（{_cdate} @ {_cpx:.4f}）")
+                        st.rerun()
+            else:
+                st.info("暂无 OPEN 持仓。")
+        if _opens:
+            _tbl = pd.DataFrame([{"id": p.id, "code": p.code, "qty": p.qty,
+                                  "open_date": str(p.open_date), "open_px": p.open_px,
+                                  "note": p.note or ""} for p in _opens])
+            st.dataframe(_tbl, use_container_width=True, hide_index=True)
+        else:
+            st.info("账本无 OPEN 持仓——风控链敞口/集中度/流动性检查将按空组合通过。")
+        _ps.close()
+    except Exception as e:
+        st.info(f"持仓管理未就绪（{type(e).__name__}: {e}）")
+
+    st.divider()
     st.subheader("模拟持仓快照差分归因")
     if st.button("生成/刷新示例持仓回放（20 交易日，读本地缓存）"):
         replay_position({d: pd.read_csv(os.path.join(CACHE_DIR, f"ri_v2_{d.replace('-', '')}.csv"),

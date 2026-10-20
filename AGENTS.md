@@ -203,10 +203,10 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 - [x] 命中率周度复核自动化运行 + 面板展示复核历史曲线；跌破基准连续 4 周 → 面板顶部黄色警告。（M6-③ `6c597c1`，真实首跑 W43 76.1% vs 54.2%）
 
 ### M7 组合与风控完整化
-- [ ] 用户可在面板添加/删除模拟持仓（API 已有 POST /positions + /close；模拟盘 Tab6 可建账户/下单；面板直连表单未接）。
+- [x] 用户可在面板添加/删除模拟持仓（M7-⑦：Tab4 真实持仓管理——录入强校验代码可解析/平仓留痕，直连 position 表；模拟盘 Tab6 建账户/下单原有）。
 - [x] 风控条件链 7 条全部实装并逐条展示通过/削减/拒绝状态。（M7-⑥：Vega/Delta/SingleStrike/DeepMoney/CapitalUsage/LiquidityGate/SignalConsistency + 有效期/浮亏/涨跌停，共 10 检查全落 verdict_json.checks）
 - [x] 流动性评分：买卖价差 + 挂单量合成 0–100 分（纯函数 `vol.pricing.liquidity`；M7-⑥ 接入建议卡 LiquidityGate——OPEN 持仓实时盘口逐合约并行抓，断网 fail-open 留痕；IV 监控页逐合约评分列未加）。
-- [ ] 合约档位标注（平值/虚值/实值 ± 档位数）+ 推荐开仓载体筛选。（tier_of 纯函数已有，面板未接）
+- [x] 合约档位标注（平值/虚值/实值 ± 档位数）+ 推荐开仓载体筛选。（M7-⑦：Tab1 近月合约档位表——tier_of + 档距 0.025 折算偏移档数 + |偏离|>2 IV 点标 ⭐ 推荐执行载体，可一键筛选）
 
 ### M8 交付打磨
 - [ ] 回测加隔夜滑点模型（T 收盘中间价 vs T+1 开盘价）。
