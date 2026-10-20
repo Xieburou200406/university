@@ -6,6 +6,12 @@ horizon: 10
 vega_limit: 881.0
 delta_limit: 15000.0
 liq_min_score: 40
+# M7-⑥ 风控链 7 条完整化新增
+single_strike_limit: 20
+deep_money_low: 0.15
+deep_money_high: 0.85
+capital_base: 100000.0
+capital_usage_limit: 0.8
 fee_rate: 0.0002
 cache_version: v2
 cache_days: 520

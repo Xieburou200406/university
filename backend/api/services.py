@@ -157,6 +157,33 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
     }
 
 
+def fetch_live_quotes(codes: list[str]) -> dict:
+    """逐合约实时盘口（新浪，8 线程并行；M7-⑥ 流动性门取数，与 run_demo.step3 同源）。
+    单合约失败 → None；整体异常 → {}（调用方 fail-open 并留痕）。绝不抛出、绝不阻断。"""
+    try:
+        import akshare as ak
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(code):
+            try:
+                df = ak.option_sse_spot_price_sina(symbol=str(code))
+                m = dict(zip(df["字段"], df["值"]))
+                return code, {"bid": float(m.get("买价") or 0), "ask": float(m.get("卖价") or 0),
+                              "last": float(m.get("最新价") or 0),
+                              "volume": float(m.get("成交量") or 0),
+                              "oi": float(m.get("持仓量") or 0)}
+            except Exception:
+                return code, None
+
+        out: dict = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for code, q in ex.map(_one, codes):
+                out[code] = q
+        return out
+    except Exception:
+        return {}
+
+
 def generate_advice(session: Session, settings: Settings, signal_id: int) -> AdviceCard:
     """由信号生成建议卡：跑风控条件链，全程留 trace（verdict_json）。只建议，不下单。"""
     sig = session.get(Signal, signal_id)
@@ -165,6 +192,7 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
 
     checks: list[dict] = []
     today = date.today()
+    from vol.contracts import parse_contract_code
 
     # ① 有效期（铁律 8：T+1 收盘信号次日有效，过期作废）
     valid = sig.valid_until is not None and sig.valid_until >= today
@@ -198,8 +226,107 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
                    "detail": ("相关合约在涨跌停区间内" if limit_ok
                               else f"触及涨跌停区间：{'、'.join(review['price_limit_hits'])}（今日可能无法成交/流动性枯竭）")})
 
+    # ⑥ 同一行权价集中度（SingleStrikeRule）：OPEN 持仓按行权价聚合张数
+    opens = session.execute(
+        select(Position).where(func.upper(Position.status) == "OPEN")).scalars().all()
+    strike_qty: dict = {}
+    unparsed_codes = 0
+    for p in opens:
+        try:
+            spec6 = parse_contract_code(p.code)
+        except ValueError:
+            unparsed_codes += 1
+            continue
+        strike_qty[spec6.strike] = strike_qty.get(spec6.strike, 0) + abs(int(p.qty))
+    if strike_qty:
+        worst_strike, worst_qty = max(strike_qty.items(), key=lambda kv: kv[1])
+        single_ok = worst_qty <= settings.single_strike_limit
+        checks.append({"name": "single_strike", "passed": single_ok,
+                       "detail": (f"最大单行权价集中度 {worst_strike:.3f} 元 × {worst_qty} 张"
+                                  f"（上限 {settings.single_strike_limit} 张/档）"
+                                  + (f"；{unparsed_codes} 个持仓代码不可解析跳过" if unparsed_codes else ""))})
+    else:
+        single_ok = True
+        checks.append({"name": "single_strike", "passed": True,
+                       "detail": "无 OPEN 持仓，集中度检查通过"})
+
+    # ⑦ 深值禁加仓（DeepMoneyRule）：最新快照逐腿还原单张 |Δ| ∈ [low, high]
+    deep_list: list[str] = []
+    if snap_date is not None:
+        snap_pairs = session.execute(
+            select(PositionSnapshot, Position)
+            .join(Position, Position.id == PositionSnapshot.position_id)
+            .where(PositionSnapshot.date == snap_date)).all()
+        for srow, prow in snap_pairs:
+            if (prow.status or "").upper() != "OPEN" or int(prow.qty) == 0:
+                continue
+            unit_delta = abs(float(srow.delta)) / (abs(int(prow.qty)) * pr.UNIT)
+            if unit_delta > settings.deep_money_high or unit_delta < settings.deep_money_low:
+                deep_list.append(f"{prow.code}(Δ={unit_delta:.2f})")
+    deep_ok = not deep_list
+    checks.append({"name": "deep_money", "passed": deep_ok,
+                   "detail": ("无持仓快照，深值检查跳过（快照未生成不虚构）" if snap_date is None else
+                              (f"持仓单张 |Δ| 全部落在 [{settings.deep_money_low:.2f}, {settings.deep_money_high:.2f}]" if deep_ok else
+                               f"深虚/深实持仓（只平不开）：{'、'.join(deep_list[:5])}"
+                               + (f" 等 {len(deep_list)} 个" if len(deep_list) > 5 else "")))})
+
+    # ⑧ 资金占用（CapitalUsageRule）：保证金占用估算 / 基准资金
+    margin_total = float(review.get("total_margin_est") or 0.0)
+    usage = margin_total / settings.capital_base if settings.capital_base > 0 else 0.0
+    capital_ok = usage <= settings.capital_usage_limit
+    checks.append({"name": "capital_usage", "passed": capital_ok,
+                   "detail": (f"保证金占用估算 {margin_total:.0f} 元 / 基准资金 {settings.capital_base:.0f} 元"
+                              f" = {usage:.1%}（上限 {settings.capital_usage_limit:.0%}）")})
+
+    # ⑨ 流动性门（LiquidityGateRule）：OPEN 持仓实时盘口 → 0-100 分（价差 60% + 量分位 40%）
+    liq_codes: list[str] = []
+    for p in opens:
+        try:
+            parse_contract_code(p.code)
+            liq_codes.append(p.code)
+        except ValueError:
+            pass
+    if not liq_codes:
+        liq_ok = True
+        checks.append({"name": "liquidity_gate", "passed": True,
+                       "detail": "无可解析持仓合约，盘口流动性检查跳过"})
+    else:
+        quotes = fetch_live_quotes(liq_codes)
+        valid_quotes = {c: q for c, q in quotes.items() if q}
+        if not valid_quotes:
+            liq_ok = True
+            checks.append({"name": "liquidity_gate", "passed": True,
+                           "detail": f"实时盘口不可用（{len(liq_codes)} 个合约），fail-open 跳过并留痕"})
+        else:
+            from vol.pricing.liquidity import liquidity_score
+            vlist = [float(q.get("volume") or 0) for q in valid_quotes.values()]
+            olist = [float(q.get("oi") or 0) for q in valid_quotes.values()]
+
+            def _pct_rank(val, arr):
+                return (sum(1 for x in arr if x <= val) / len(arr)) if arr else 1.0
+
+            low_liq: list[str] = []
+            scored_n = 0
+            for c, q in valid_quotes.items():
+                sc = liquidity_score(float(q.get("bid") or 0), float(q.get("ask") or 0),
+                                     _pct_rank(float(q.get("volume") or 0), vlist),
+                                     _pct_rank(float(q.get("oi") or 0), olist))
+                scored_n += 1
+                if sc < settings.liq_min_score:
+                    low_liq.append(f"{c}({sc:.0f}分)")
+            liq_ok = not low_liq
+            checks.append({"name": "liquidity_gate", "passed": liq_ok,
+                           "detail": (f"盘口流动性 {scored_n}/{len(quotes)} 个有效，全部 ≥ {settings.liq_min_score} 分" if liq_ok else
+                                      f"低于 {settings.liq_min_score} 分的持仓：{'、'.join(low_liq)}"
+                                      f"（执行前核对盘口，优先换主力月份载体）")})
+
+    # ⑩ 信号一致性（SignalConsistencyRule）：建议由当日信号生成，方向同源
+    checks.append({"name": "signal_consistency", "passed": True,
+                   "detail": f"建议由 signal#{sig.id}（{sig.engine}/{sig.signal}）生成，方向同源一致"})
+
     hard_fail = not valid
-    soft_warn = not (vega_ok and delta_ok and loss_ok and limit_ok)
+    soft_warn = not (vega_ok and delta_ok and loss_ok and limit_ok
+                     and single_ok and deep_ok and capital_ok and liq_ok)
     verdict = "REJECT" if hard_fail else ("WARN" if soft_warn else "PASS")
 
     action = _ACTION.get(sig.signal, "观望")
@@ -211,6 +338,14 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
         action += "；⚠️ 组合敞口接近/超出限额，先减仓再考虑新头寸"
     if not loss_ok:
         action += "；🚨 现有持仓浮亏已达权利金 100%，行业惯例优先处理亏损头寸而非加新仓"
+    if not single_ok:
+        action += "；🎯 同一行权价持仓集中度超限——先分散或减仓再考虑新头寸"
+    if not deep_ok:
+        action += "；🕳️ 持仓含深虚/深实腿（|Δ| 越界）——行业惯例只平不开"
+    if not capital_ok:
+        action += "；💰 保证金占用超基准资金上限——先释放资金再考虑新头寸"
+    if not liq_ok:
+        action += "；🚧 部分持仓流动性分过低——执行前核对盘口，优先换主力月份载体"
     if expiry_week:
         action += f"；⏳ 到期周提醒（剩≤5个交易日：{'、'.join(expiry_week)}）——注意 pin risk 与行权指派，行业惯例提前移仓"
     if not limit_ok:

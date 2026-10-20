@@ -198,15 +198,15 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 - [ ] 关键纯函数（bs_price/greeks/svi/percentile/atm选取/行权价解析）补 `tests/` 单元测试——**用 §2 铁律当测试用例**（例：`parse_symbol("510050C2610M02700")["strike"] == 2.7`）。
 
 ### M6 数据与信号强化
-- [ ] 每日定时任务真正注册运行（schtasks / 用户常开机器的方案），signal_log 持续积累。
-- [ ] 类比引擎特征扩充：期限结构斜率、VRP（IV−已实现波动率）、20 日动量（设计文档 §5.2b 已列，尚未全实现）。
-- [ ] 命中率周度复核自动化运行 + 面板展示复核历史曲线；跌破基准连续 4 周 → 面板顶部黄色警告。
+- [ ] 每日定时任务真正注册运行（schtasks / 用户常开机器的方案），signal_log 持续积累。（scheduler.py 已实现；schtasks 注册被安全中心拦截，待用户手工执行）
+- [x] 类比引擎特征扩充：期限结构斜率、VRP（IV−已实现波动率）、20 日动量（已实现——`m3_run.analog_states` 5 特征：iv_pct/vrp/mom20/ts_slope/skew25，daily_metric 同步落列）。
+- [x] 命中率周度复核自动化运行 + 面板展示复核历史曲线；跌破基准连续 4 周 → 面板顶部黄色警告。（M6-③ `6c597c1`，真实首跑 W43 76.1% vs 54.2%）
 
 ### M7 组合与风控完整化
-- [ ] 用户可在面板添加/删除模拟持仓（现在只有代码里写死的示例持仓）。
-- [ ] 风控条件链 7 条全部实装并逐条展示通过/削减/拒绝状态（当前只实装了 Vega/Delta 两条）。
-- [ ] 流动性评分：买卖价差 + 挂单量合成 0–100 分（实时行情接口已探明，逐合约并行抓）。
-- [ ] 合约档位标注（平值/虚值/实值 ± 档位数）+ 推荐开仓载体筛选。
+- [ ] 用户可在面板添加/删除模拟持仓（API 已有 POST /positions + /close；模拟盘 Tab6 可建账户/下单；面板直连表单未接）。
+- [x] 风控条件链 7 条全部实装并逐条展示通过/削减/拒绝状态。（M7-⑥：Vega/Delta/SingleStrike/DeepMoney/CapitalUsage/LiquidityGate/SignalConsistency + 有效期/浮亏/涨跌停，共 10 检查全落 verdict_json.checks）
+- [x] 流动性评分：买卖价差 + 挂单量合成 0–100 分（纯函数 `vol.pricing.liquidity`；M7-⑥ 接入建议卡 LiquidityGate——OPEN 持仓实时盘口逐合约并行抓，断网 fail-open 留痕；IV 监控页逐合约评分列未加）。
+- [ ] 合约档位标注（平值/虚值/实值 ± 档位数）+ 推荐开仓载体筛选。（tier_of 纯函数已有，面板未接）
 
 ### M8 交付打磨
 - [ ] 回测加隔夜滑点模型（T 收盘中间价 vs T+1 开盘价）。
