@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from db.models import (AdviceCard, DailyMetric, OpenForecast, PipelineRun,
-                       Position, PositionSnapshot, RiskBudget, Signal)
+                       Position, PositionSnapshot, ReviewLog, RiskBudget, Signal)
 from db.models import SimAccount as SimAccountDB
 from db.models import SimFill as SimFillDB
 from db.models import SimNav as SimNavDB
@@ -948,3 +948,68 @@ def sim_waterfall(session: Session, account_id: int, from_date: date, to_date: d
     return {"account_id": account_id, "name": a.name, "asof": str(last_date),
             "steps": steps,
             "identity_ok": abs(sum(r["pnl"] for r in rows) + a.cash0 - end) < 0.05}
+
+
+# ---------------------------------------------------------------- M6-③ 命中率周度复核
+REVIEW_MIN_SAMPLES = 30      # 有效样本下限，不足则跳过本次记录
+REVIEW_WARN_STREAK = 4       # 连续 N 周跌破基准 → warn（面板黄色警告）
+
+
+def run_weekly_review(session: Session, asof: date | None = None) -> dict:
+    """命中率周度复核（M6-③）：m2 缓存面板 → analog_states walk-forward →
+    滚动样本外方向命中率 vs 朴素基准（多数方向命中率）→ ReviewLog（同周覆盖）。
+    by_regime_json 按 高/低 IV 期（IV 中位数）分组命中率。
+    warn = 最近 REVIEW_WARN_STREW 周（含本周）全部 hit_rate < baseline。
+    读缓存为主，缺新日自动补拉；样本不足 fail-soft 跳过不落库。"""
+    import numpy as np
+    from m2_run import WINDOW, HORIZON, build_daily_history
+    from m3_run import analog_states
+    df = build_daily_history()
+    ana = analog_states(df)
+    hits, actuals, hi_hits, lo_hits = [], [], [], []
+    med = float(df["iv_near"].median())
+    for i in range(WINDOW, len(df["iv_near"]) - HORIZON):
+        if ana[i] == 0:
+            continue
+        actual = df["iv_near"][i + HORIZON] - df["iv_near"][i]
+        if abs(actual) <= 0.001:
+            continue
+        h = (ana[i] > 0) == (actual > 0)
+        hits.append(h)
+        actuals.append(actual > 0)
+        (hi_hits if df["iv_near"][i] > med else lo_hits).append(h)
+    n = len(hits)
+    if n < REVIEW_MIN_SAMPLES:
+        _safe_log("X", "weekly_review", {"skip": "low_samples", "n": n})
+        return {"recorded": False, "samples": n, "reason": f"有效样本 {n} < {REVIEW_MIN_SAMPLES}"}
+    hit_rate = float(np.mean(hits))
+    baseline = float(max(np.mean(actuals), 1 - np.mean(actuals)))
+
+    ref = asof or date.today()
+    iso = ref.isocalendar()
+    week = f"{iso.year}-W{iso.week:02d}"
+    row = session.execute(select(ReviewLog).where(ReviewLog.week == week)).scalar_one_or_none()
+    if row is None:
+        row = ReviewLog(week=week)
+        session.add(row)
+    row.sample_n, row.hit_rate, row.baseline = n, round(hit_rate, 4), round(baseline, 4)
+    row.by_regime_json = {
+        "panel_days": len(df),
+        "hit_rate_high_iv": round(float(np.mean(hi_hits)), 4) if hi_hits else None,
+        "hit_rate_low_iv": round(float(np.mean(lo_hits)), 4) if lo_hits else None,
+        "edge": round(hit_rate - baseline, 4),
+    }
+    session.flush()
+
+    # 连续 N 周跌破基准（含本周）→ warn；本周未跌破则清零
+    recent = session.execute(select(ReviewLog).order_by(ReviewLog.id.desc())
+                             .limit(REVIEW_WARN_STREAK)).scalars().all()
+    row.warn = (len(recent) >= REVIEW_WARN_STREAK
+                and all(r.hit_rate < r.baseline for r in recent))
+    session.commit()
+    _safe_log("S", "weekly_review", {"week": week, "n": n,
+                                     "hit": round(hit_rate, 4), "base": round(baseline, 4),
+                                     "warn": row.warn})
+    return {"recorded": True, "week": week, "samples": n,
+            "hit_rate": round(hit_rate, 4), "baseline": round(baseline, 4),
+            "edge": round(hit_rate - baseline, 4), "warn": row.warn}

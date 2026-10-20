@@ -50,6 +50,12 @@ def main() -> int:
         summary = run.error or ""
         print(f"pipeline: {run.status} {summary}", flush=True)
 
+        # 周五顺带命中率周度复核（M6-③；同周覆盖幂等，低样本 fail-soft）
+        if date.today().weekday() == 4:
+            from api.services import run_weekly_review
+            rv = run_weekly_review(s)
+            print(f"weekly review: {rv}", flush=True)
+
         # ④ 六步排查留痕（只读；结果只进日志，不出阻断）
         diag = run_diagnosis(s)
         bad = [k for k, v in diag.items() if isinstance(v, dict) and v.get("ok") is False]

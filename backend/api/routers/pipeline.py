@@ -18,6 +18,12 @@ def reviews_router() -> APIRouter:
         return db.execute(select(ReviewLog).order_by(ReviewLog.id.desc())
                           .limit(min(limit, 52))).scalars().all()
 
+    @r.post("/reviews/run")
+    def run_review(db: Session = Depends(get_db)):
+        """触发一次命中率周度复核（M6-③：同周覆盖，幂等）。"""
+        from api.services import run_weekly_review
+        return run_weekly_review(db)
+
     return r
 
 

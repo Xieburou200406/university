@@ -314,6 +314,38 @@ with tab2:
     except Exception:
         pass  # 建议区故障不阻断信号台（fail-loud-not-crash）
 
+    st.divider()
+    # ---- M6-③ 命中率周度复核（ReviewLog 历史曲线 + 跌破基准黄色警告）----
+    try:
+        import sqlite3 as _sq2
+        _con2 = _sq2.connect(DB_PATH)
+        _rev = pd.read_sql_query(
+            "SELECT week, sample_n, hit_rate, baseline, warn FROM review_log "
+            "ORDER BY id ASC LIMIT 52", _con2)
+        _con2.close()
+        if len(_rev) and _rev["warn"].iloc[-1]:
+            st.warning("⚠️ 类比引擎命中率已连续 4 周跌破朴素基准——增量消失，"
+                       "请把引擎输出降级为参考并考虑回撤窗口参数。")
+        if len(_rev):
+            st.subheader("命中率周度复核（样本外，滚动）")
+            import plotly.graph_objects as _go2
+            _fig = _go2.Figure()
+            _fig.add_trace(_go2.Bar(x=_rev["week"], y=_rev["hit_rate"] * 100,
+                                    name="引擎命中率", marker_color="#d62728",
+                                    text=[f"{x:.1%}" for x in _rev["hit_rate"]],
+                                    textposition="outside"))
+            _fig.add_trace(_go2.Scatter(x=_rev["week"], y=_rev["baseline"] * 100,
+                                        name="朴素基准", mode="lines+markers",
+                                        line=dict(color="#7f7f7f", dash="dash")))
+            _fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10),
+                               yaxis_title="命中率 %", legend=dict(orientation="h"))
+            st.plotly_chart(_fig, use_container_width=True)
+            st.caption(f"最近 {len(_rev)} 次复核 · "
+                       "样本外方向命中率 vs 朴素基准（多数方向命中率）；"
+                       "跌破基准连续 4 周面板顶部黄色警告。诚实边界：类比引擎是统计规律非保证。")
+    except Exception:
+        pass  # 复核区故障不阻断信号台
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("引擎 A · IV 分位数")
