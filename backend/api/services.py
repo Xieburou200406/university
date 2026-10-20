@@ -55,6 +55,48 @@ def latest_exposure(session: Session) -> tuple[date | None, float, float]:
     return latest, vega, delta
 
 
+def snapshot_positions(session: Session, d: date, spot: float, iv: float) -> dict:
+    """持仓收盘估值快照（§RiskService.snapshot 落地，管线每日最后一步）。
+    对 OPEN 持仓按合约代码 BS 估值（用当日截面 spot/IV），落 position_snapshot。
+    口径：delta/vega/theta（元）= 单张 greeks × qty(带符号) × UNIT(10000)，theta 年化。
+    幂等：同 (date, position_id) 已存在 → DELETE+INSERT 覆盖（append-only 触发器只拦
+    UPDATE，当日行重跑重写、历史行不动，与设计 §管线幂等一致）。
+    code 不可解析（演示/遗留持仓）→ fail-soft 跳过并记日志，绝不阻断管线。"""
+    from vol.contracts import parse_contract_code
+    from vol.pricing.bs import bs_price, greeks
+    from vol.sim.broker import R_FREE
+    out = {"date": str(d), "snapshotted": 0, "skipped": [], "open_positions": 0}
+    opens = session.execute(select(Position)
+                            .where(func.upper(Position.status) == "OPEN")).scalars().all()
+    out["open_positions"] = len(opens)
+    for p in opens:
+        try:
+            spec = parse_contract_code(p.code)
+        except ValueError:
+            out["skipped"].append({"id": p.id, "reason": f"code 不可解析: {p.code[:40]}"})
+            continue
+        T = max((spec.expiry - d).days, 1) / 365.0            # 铁律 2：365 自然日
+        dd, _, vv, tt = greeks(spot, spec.strike, T, R_FREE, iv, spec.cp)
+        px = bs_price(spot, spec.strike, T, R_FREE, iv, spec.cp)
+        row = session.execute(select(PositionSnapshot).where(
+            PositionSnapshot.date == d, PositionSnapshot.position_id == p.id)).scalar_one_or_none()
+        if row is not None:
+            session.delete(row)                               # REPLACE 语义（当日行重写）
+            session.flush()
+        session.add(PositionSnapshot(
+            date=d, position_id=p.id,
+            mv=p.qty * px * pr.UNIT,
+            delta=p.qty * dd * pr.UNIT, vega=p.qty * vv * pr.UNIT,
+            theta=p.qty * tt * pr.UNIT, iv=iv, spot=spot))
+        out["snapshotted"] += 1
+    session.flush()
+    if out["snapshotted"] or out["skipped"]:
+        _safe_log("S", "position_snapshot", {"date": str(d).replace("-", ""),
+                                             "ok": out["snapshotted"],
+                                             "skip": len(out["skipped"])})
+    return out
+
+
 def position_risk_review(session: Session, asof: date | None = None) -> dict:
     """持仓风险评审（§20.2 P1）：保证金占用估算 + 浮亏触发线 + 到期周提醒。
     纯聚合：只读 Position × PositionSnapshot，算术全部委托 vol.position_risk 纯函数。
@@ -132,8 +174,12 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
     # ② Vega 限额
     snap_date, vega, delta = latest_exposure(session)
     vega_ok = abs(vega) <= settings.vega_limit
+    # 快照新鲜度：快照日落后于面板最新截面 → 敞口是旧数字（管线停跑或持仓未估值）
+    panel_latest = session.execute(select(func.max(DailyMetric.date))).scalar_one()
+    stale = snap_date is not None and panel_latest is not None and snap_date < panel_latest
     checks.append({"name": "vega_limit", "passed": vega_ok,
-                   "detail": f"组合vega={vega:.1f} (每1.0 IV口径), 限额±{settings.vega_limit}, 快照日={snap_date}"})
+                   "detail": (f"组合vega={vega:.1f} (每1.0 IV口径), 限额±{settings.vega_limit}, 快照日={snap_date}"
+                              + (f"；⚠ 快照落后面板最新截面 {panel_latest}，敞口非当日口径" if stale else ""))})
 
     # ③ Delta 限额
     delta_ok = abs(delta) <= settings.delta_limit
@@ -257,10 +303,13 @@ def compute_and_store_daily(session: Session, settings: Settings, fetch_df=None)
                                   "date": d_str.replace("-", ""), "valid_until": str(r.valid_until)})
     _safe_log("P", "pipeline", {"step": "compute_daily", "ok": 1,
                                 "ms": int((time.perf_counter() - t0) * 1000)})
+    # 持仓收盘估值快照（§RiskService.snapshot 落地）：跟着管线走，vega/delta 限额才不卡死
+    snap = snapshot_positions(session, d, float(df["spot"].iloc[-1]), iv_now)
     jump = _iv_jump_review(session, d, {})          # §17.6：跳变留痕 + 连续跳变降级
     return {"date": d_str, "percentile": pct["signal"], "analog": ana_sig,
             "agree": agree, "iv_now": round(iv_now, 4), "iv_pct_120": pct.get("iv_pct"),
-            "iv_jump": jump["iv_jump"], "iv_degrade": jump["iv_degrade"]}
+            "iv_jump": jump["iv_jump"], "iv_degrade": jump["iv_degrade"],
+            "snapshot": snap}
 
 
 LAMBDA_MAP = {"conservative": 8.0, "balanced": 4.0, "aggressive": 2.0}   # §14.1 三档
