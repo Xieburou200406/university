@@ -77,22 +77,25 @@ def market_fill_px(px: float, side: str) -> float:
 def try_match(order: SimOrder, virtual_date: date, spot: float, sigma: float,
               r: float = R_FREE) -> list[SimFill] | None:
     """按虚拟日收盘截面撮合。全部腿同日成交（组合单原子性）或整体不成。
-    T 按 365 自然日口径（铁律 2）。到期日及以后不再成交（作废）。"""
+    T 按 365 自然日口径（铁律 2）。到期日及以后不再成交（作废）。
+    支持腿级到期日（日历价差）：腿未指定到期则继承订单到期；任一腿已到期 → 整单作废。"""
     if order.submit_date > virtual_date or order.status != "pending":
         return None
-    if virtual_date >= order.expiry:
+    exps = [lg.expiry or order.expiry for lg in order.legs]
+    if virtual_date >= min(exps):
         order.status = "cancelled"
         return None
-    T = (order.expiry - virtual_date).days / 365.0
     if order.price_type == "limit" and order.limit_px is not None:
-        ref = option_px(spot, order.legs[0].strike, T, sigma, order.legs[0].cp, r)
+        T0 = (exps[0] - virtual_date).days / 365.0
+        ref = option_px(spot, order.legs[0].strike, T0, sigma, order.legs[0].cp, r)
         if order.legs[0].side == "buy" and order.limit_px < ref * (1 + HALF_SPREAD):
             return None                       # 限价买单价未触卖方报价
         if order.legs[0].side == "sell" and order.limit_px > ref * (1 - HALF_SPREAD):
             return None                       # 限价卖单价未触买方报价
     fills = []
-    for lg in order.legs:
-        lg.expiry = order.expiry
+    for lg, exp in zip(order.legs, exps):
+        lg.expiry = exp
+        T = (exp - virtual_date).days / 365.0
         px = option_px(spot, lg.strike, T, sigma, lg.cp, r)
         if order.price_type == "limit" and order.limit_px is not None:
             px = order.limit_px / max(len(order.legs), 1)   # 组合限价按腿均摊（简化）

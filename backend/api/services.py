@@ -601,8 +601,8 @@ def create_sim_order(session: Session, account_id: int, submit_date: date, expir
         raise LookupError(f"submit_date {submit_date} 当日无行情截面（信息墙：不许偷看/虚构未来日期）")
     if tpl_id:
         from vol.sim.templates import get_template
-        legs = [l.__dict__ | {"expiry": None} for l in
-                get_template(tpl_id).generate_legs(dm.spot, expiry, qty, params)]
+        legs = [l.__dict__ | {"expiry": (str(l.expiry) if l.expiry else None)} for l in
+                get_template(tpl_id).generate_legs(dm.spot, expiry, qty, params)]  # 日历价差腿级到期
     if not legs:
         raise ValueError("legs 为空（模板展开失败或未提供）")
     o = SimOrderDB(account_id=account_id, tpl_id=tpl_id, params_json=params,
@@ -644,8 +644,9 @@ def _replay_setup(session: Session, from_date: date, to_date: date,
             svc.create(a.name, a.cash0, a.auto_mirror)
     sim_orders = []
     for o in order_rows:
-        legs = [SimLeg(l["cp"], float(l["strike"]), l["side"], int(l["qty"]))
-                for l in o.legs_json]
+        legs = [SimLeg(l["cp"], float(l["strike"]), l["side"], int(l["qty"]),
+                       expiry=date.fromisoformat(l["expiry"]) if l.get("expiry") else None)
+                for l in o.legs_json]                 # 日历价差：腿级到期日
         sim_orders.append(SimOrder(id=o.id, account_id=o.account_id, legs=legs,
                                    submit_date=o.submit_date, expiry=o.expiry,
                                    price_type=o.price_type, limit_px=o.limit_px,
@@ -763,10 +764,11 @@ def _order_pnl_rows(session: Session, from_date: date, to_date: date,
         for leg in legs:
             signed = leg["qty"] if leg["side"] == "buy" else -leg["qty"]
             K = float(leg["strike"])
-            if last_date >= o.expiry:                 # 已到期：内在价值结算口径
+            leg_exp = date.fromisoformat(leg["expiry"]) if leg.get("expiry") else o.expiry
+            if last_date >= leg_exp:                  # 已到期：内在价值结算口径
                 px = _intrinsic(spot_now, K, leg["cp"])
             else:
-                T = max((o.expiry - last_date).days, 1) / 365.0
+                T = max((leg_exp - last_date).days, 1) / 365.0
                 px = option_px(spot_now, K, T, iv_now, leg["cp"])
             value += signed * px * pr.UNIT
         rows.append({

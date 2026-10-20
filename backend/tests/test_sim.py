@@ -108,7 +108,9 @@ def test_templates_strike_grid():
     assert legs2[0].strike == 3.30 and legs2[1].strike == 2.70
     with pytest.raises(KeyError):
         get_template("nope")
-    assert set(REGISTRY) == {"sell_straddle", "buy_straddle", "sell_strangle"}
+    assert set(REGISTRY) == {"sell_straddle", "buy_straddle", "sell_strangle",
+                             "buy_strangle", "bull_call_spread", "bear_put_spread",
+                             "calendar_spread", "iron_condor"}
 
 
 # ---------- 回放集成：IV 飙升 → 买跨式应显著跑赢基准 ----------
@@ -290,6 +292,56 @@ def test_api_sim_compare_waterfall(client):
     r = client.get("/api/sim/accounts/99/waterfall",
                    params={"from_date": str(DAYS[0]), "to_date": str(DAYS[5])})
     assert r.status_code == 404
+
+
+# ---------- P3 模板扩容：8 个内置模板 + 腿级到期日 ----------
+def test_templates_expanded_registry():
+    from vol.sim.templates import prev_monthly_expiry
+    assert set(REGISTRY) == {"sell_straddle", "buy_straddle", "sell_strangle", "buy_strangle",
+                             "bull_call_spread", "bear_put_spread", "calendar_spread",
+                             "iron_condor"}
+    K = round_strike(3.0)
+    # 宽跨买：两翼虚值 buy
+    legs = get_template("buy_strangle").generate_legs(3.0, DAYS[-1])
+    assert legs[0].strike > 3.0 > legs[1].strike and all(l.side == "buy" for l in legs)
+    # 牛市价差：买低卖高 Call
+    legs = get_template("bull_call_spread").generate_legs(3.0, DAYS[-1])
+    assert legs[0].side == "buy" and legs[1].side == "sell" and legs[1].strike > legs[0].strike
+    # 熊市价差：买高卖低 Put
+    legs = get_template("bear_put_spread").generate_legs(3.0, DAYS[-1])
+    assert legs[0].side == "buy" and legs[1].side == "sell" and legs[1].strike < legs[0].strike
+    # 日历价差：同 K，卖近月买远月（腿级到期）
+    far = date(2026, 12, 23)
+    legs = get_template("calendar_spread").generate_legs(3.0, far)
+    assert legs[0].expiry < legs[1].expiry == far
+    assert legs[0].side == "sell" and legs[1].side == "buy"
+    assert legs[0].strike == legs[1].strike
+    assert prev_monthly_expiry(far) == date(2026, 11, 25)      # 近月=前一月第四个周三
+    # 铁鹰：4 腿，卖内翼买外翼
+    legs = get_template("iron_condor").generate_legs(3.0, DAYS[-1])
+    assert len(legs) == 4
+    assert [l.side for l in legs] == ["sell", "buy", "sell", "buy"]
+    assert legs[1].strike > legs[0].strike and legs[3].strike < legs[2].strike
+
+
+def test_calendar_spread_per_leg_expiry_replay():
+    """日历价差端到端：腿级到期持久化 → 撮合（近月到期前）→ 估值按各腿自己的 T。"""
+    from api.services import create_sim_account, create_sim_order, run_sim_replay
+    from db.models import SimFill as SimFillDB, SimOrder as SimOrderDB
+    from sqlalchemy import select
+    s = _memory_session()
+    sig, d0, days = _seed_journal_world(s, [0.20, 0.20, 0.20, 0.20])
+    a = create_sim_account(s, "自由", 100000.0)
+    far = d0 + timedelta(days=150)
+    o = create_sim_order(s, a.id, d0, far, tpl_id="calendar_spread", qty=1)
+    # 持久化的 legs_json 带腿级到期
+    o_db = s.execute(select(SimOrderDB)).scalar_one()
+    assert o_db.legs_json[0]["expiry"] is not None
+    assert o_db.legs_json[0]["expiry"] < str(far)
+    res = run_sim_replay(s, d0, days[-1])
+    assert len(res["fills"]) == 2 and res["days"] == 4          # 两腿同日成交
+    fills = s.execute(select(SimFillDB).order_by(SimFillDB.leg_index)).scalars().all()
+    assert fills[0].fill_px < fills[1].fill_px                  # 近月权利金 < 远月（同 K 同 IV）
 
 
 # ---------- API 端到端（注入内存库） ----------

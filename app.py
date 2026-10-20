@@ -531,10 +531,18 @@ with tab6:
                 _acc_map = {f"#{r['id']} {r['name']}": int(r["id"]) for _, r in accts.iterrows()}
                 o1, o2, o3, o4 = st.columns([2, 2, 1, 1])
                 _acc = o1.selectbox("账户", list(_acc_map), key="sim_ord_acct")
-                _tpl = o2.selectbox("策略模板", ["buy_straddle", "sell_straddle", "sell_strangle"],
+                _tpl = o2.selectbox("策略模板",
+                                    ["buy_straddle", "sell_straddle", "buy_strangle",
+                                     "sell_strangle", "bull_call_spread", "bear_put_spread",
+                                     "calendar_spread", "iron_condor"],
                                     format_func={"buy_straddle": "买入跨式（做多波动率）",
                                                  "sell_straddle": "卖出跨式（收权利金）",
-                                                 "sell_strangle": "卖出宽跨式（虚值收权利金）"}.__getitem__,
+                                                 "buy_strangle": "买入宽跨式（虚值做多波动率）",
+                                                 "sell_strangle": "卖出宽跨式（虚值收权利金）",
+                                                 "bull_call_spread": "牛市看涨价差（买低卖高 Call）",
+                                                 "bear_put_spread": "熊市看跌价差（买高卖低 Put）",
+                                                 "calendar_spread": "日历价差（卖近月买远月）",
+                                                 "iron_condor": "铁鹰（双翼虚值，风险有限）"}.__getitem__,
                                     key="sim_ord_tpl")
                 _qty = o3.number_input("张数", min_value=1, value=1, step=1, key="sim_ord_qty")
                 _sub = o4.date_input("提交日（须有截面）",
