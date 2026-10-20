@@ -59,3 +59,28 @@ def parse_sse_etf_code(code: str, underlying: str = "510050"):
     if not m:
         return None
     return {"cp": m.group(1), "expiry": "20" + m.group(2), "strike": int(m.group(3)) / 1000.0}
+
+
+# ---------------------------------------------------------------- 除权合约过滤（§20 P3 风险项 7）
+def filter_exrights(df, sym_col: str = "sym", cp_col: str = "cp",
+                    expiry_col: str = "expiry", strike_col: str = "strike"):
+    """除权调整合约并存过滤（§20 P3-7：ATM 选取可能错位，拉取端过滤）。
+
+    上交所除权处理：除权除息日新挂一批调整合约，**简称尾缀带 'A'**（原合约代码/简称
+    不变但实际行权价已调整）。两种污染源：
+      ① 调整新挂合约（简称尾缀 A）与原合约并存 → 同一 (cp, expiry, strike) 多行；
+      ② 原合约代码里的行权价数字除权后已失真（真实行权价需修正表，无表不可恢复）。
+    口径：剔除简称尾缀 A 的调整合约 → 按 (cp, expiry, strike) 去重保留首条；
+    返回 (过滤后 df, stats)——stats 供 opslog 打 X 事件，让除权日可审计。
+    """
+    import pandas as pd
+    n0 = len(df)
+    d = df.copy()
+    if sym_col in d.columns:
+        d = d[~d[sym_col].astype(str).str.endswith("A")]   # 调整合约简称尾缀 A
+    n_adj = n0 - len(d)
+    before_dedup = len(d)
+    d = d.drop_duplicates(subset=[c for c in (cp_col, expiry_col, strike_col) if c in d.columns],
+                          keep="first")
+    stats = {"total": int(n0), "adjusted_dropped": int(n_adj), "dedup_dropped": int(before_dedup - len(d))}
+    return d.reset_index(drop=True), stats

@@ -21,7 +21,7 @@ import akshare as ak
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
 from vol.pricing.curve import fit_curve_iv
-from vol.contracts import expiry_from_code as _expiry_from_ym
+from vol.contracts import expiry_from_code as _expiry_from_ym, filter_exrights
 from vol.signals import PercentileEngine, AnalogEngine, build_features
 from run_demo import (UNDERLYING, UNIT, R_FREE, HIST_DAYS, parse_symbol,
                       step1_underlying_and_contracts, step2_risk_indicator,
@@ -57,7 +57,10 @@ def load_day(date_compact):
     v2：行权价量纲修复（/1000）后的缓存版本，旧缓存文件作废。"""
     fp = os.path.join(CACHE_DIR, f"ri_v2_{date_compact}.csv")
     if os.path.exists(fp):
-        return pd.read_csv(fp, dtype={"code": str})
+        t = pd.read_csv(fp, dtype={"code": str})
+        # 老缓存兜底：除权调整合约并存会破坏 ATM 选取（读侧统一过滤，幂等）
+        t, _ = filter_exrights(t)
+        return t
     try:
         t = ak.option_risk_indicator_sse(date=date_compact)
     except Exception:
@@ -73,6 +76,12 @@ def load_day(date_compact):
     t["cp"] = parsed.map(lambda d: d.get("cp") if d else None)
     t["expiry"] = parsed.map(lambda d: d.get("expiry") if d else None)
     t = t.dropna(subset=["strike", "cp", "expiry"])
+    if len(t) == 0:
+        return None
+    t, ex_stats = filter_exrights(t)          # §20 P3-7：除权调整合约并存过滤（写缓存前）
+    if ex_stats["adjusted_dropped"] or ex_stats["dedup_dropped"]:
+        from vol.opslog import log_event
+        log_event("X", "exrights", {**ex_stats, "date": date_compact})
     if len(t) == 0:
         return None
     os.makedirs(CACHE_DIR, exist_ok=True)

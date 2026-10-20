@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "bac
 from vol.pricing.bs import implied_vol
 from vol.pricing.curve import fit_curve_iv
 from vol.pricing.liquidity import liquidity_score
-from vol.contracts import parse_sse_etf_code
+from vol.contracts import parse_sse_etf_code, filter_exrights
 from vol.signals import PercentileEngine, AnalogEngine, build_features, synthetic_history
 
 UNDERLYING = "sh510050"
@@ -57,6 +57,11 @@ def step1_underlying_and_contracts():
     contracts["cp"] = contracts["合约交易代码"].map(lambda s: (parse_symbol(s) or {}).get("cp"))
     contracts["expiry_s"] = contracts["合约交易代码"].map(lambda s: (parse_symbol(s) or {}).get("expiry"))
     contracts = contracts.dropna(subset=["strike", "cp", "expiry_s"])
+    contracts, ex_stats = filter_exrights(          # §20 P3-7：除权调整合约并存过滤
+        contracts, sym_col="合约简称", expiry_col="expiry_s")
+    if ex_stats["adjusted_dropped"] or ex_stats["dedup_dropped"]:
+        log(f"  除权过滤: 调整合约 {ex_stats['adjusted_dropped']} 条 + 重复 "
+            f"{ex_stats['dedup_dropped']} 条（余 {ex_stats['total']}）")
     log(f"  合约总数 = {len(contracts)}")
     return spot_now, contracts
 

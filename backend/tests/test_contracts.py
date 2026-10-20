@@ -40,3 +40,31 @@ def test_sse_etf_code_tolerant_suffix():
     assert parse_sse_etf_code("510050C2610M02700")["strike"] == 2.7
     assert parse_sse_etf_code("510050C2610M02700A")["strike"] == 2.7
     assert parse_sse_etf_code("510050C2610A02700") is None      # 无 M 标记 → 拒绝（与旧口径一致）
+
+
+def test_filter_exrights_adjusted_and_dedup():
+    """§20 P3-7：剔除调整合约（简称尾缀 A）+ 同 (cp, expiry, strike) 去重。"""
+    import pandas as pd
+    from vol.contracts import filter_exrights
+    df = pd.DataFrame([
+        {"code": "10005163", "sym": "50ETF购12月2700", "cp": "C", "expiry": "202612", "strike": 2.7, "iv": 0.20},
+        {"code": "10005163A", "sym": "50ETF购12月2700A", "cp": "C", "expiry": "202612", "strike": 2.7, "iv": 0.19},
+        {"code": "10005164", "sym": "50ETF沽12月2700", "cp": "P", "expiry": "202612", "strike": 2.7, "iv": 0.22},
+        {"code": "10005170", "sym": "50ETF购12月2750", "cp": "C", "expiry": "202612", "strike": 2.75, "iv": 0.21},
+        {"code": "10005999", "sym": "50ETF购12月2700", "cp": "C", "expiry": "202612", "strike": 2.7, "iv": 0.18},  # 重复
+    ])
+    out, stats = filter_exrights(df)
+    assert stats == {"total": 5, "adjusted_dropped": 1, "dedup_dropped": 1}
+    assert len(out) == 3
+    assert "10005163A" not in set(out["code"])          # 调整合约被剔除
+    assert set(out["iv"]) == {0.20, 0.22, 0.21}         # 同组合保留首条（原合约）
+
+
+def test_filter_exrights_no_sym_column():
+    """无简称列时仅做组合去重（口径降级不报错）。"""
+    import pandas as pd
+    from vol.contracts import filter_exrights
+    df = pd.DataFrame([{"cp": "C", "expiry": "202612", "strike": 2.7, "iv": 0.20},
+                       {"cp": "C", "expiry": "202612", "strike": 2.7, "iv": 0.19}])
+    out, stats = filter_exrights(df)
+    assert stats["adjusted_dropped"] == 0 and stats["dedup_dropped"] == 1 and len(out) == 1
