@@ -48,7 +48,13 @@ def rotate_if_stale(log_dir=None, today: date | None = None) -> bool:
         else datetime.fromtimestamp(curr.stat().st_mtime).date().isoformat()
     if created == today.isoformat():
         return False
-    curr.rename(d / _ARCHIVE.format(created.replace("-", "")))
+    target = d / _ARCHIVE.format(created.replace("-", ""))
+    if target.exists():                       # 同日归档已存在（跨日多次轮转/残留）→ 加序号，绝不覆盖
+        n = 1
+        while (d / _ARCHIVE.format(f"{created.replace('-', '')}_{n}")).exists():
+            n += 1
+        target = d / _ARCHIVE.format(f"{created.replace('-', '')}_{n}")
+    curr.rename(target)
     marker.write_text(today.isoformat(), encoding="ascii")
     return True
 

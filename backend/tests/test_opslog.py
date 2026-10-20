@@ -122,3 +122,20 @@ def test_pipeline_failure_emits_x_event(monkeypatch, session):
         svc.compute_and_store_daily(session, svc.Settings(), fetch_df=pd.DataFrame())
     x_events = [f for c, k, f in events if c == "X"]
     assert x_events and x_events[0]["reason"] == "no_panel"     # 负记录：为什么没信号
+
+
+def test_rotate_target_exists(tmp_path, monkeypatch):
+    """归档目标已存在 → 加序号 _1/_2，绝不覆盖旧归档。"""
+    from pathlib import Path
+    from vol.opslog import _CURR, _MARKER, _ARCHIVE, log_event, rotate_if_stale
+    d = Path(tmp_path)
+    monkeypatch.setenv("OPSLOG_DIR", str(d))     # 覆盖 conftest 隔离，让 log_event 写进 tmp_path
+    (d / "ops-20261019.log").write_text("old archive", encoding="utf-8")
+    (d / "ops-20261019_1.log").write_text("older archive", encoding="utf-8")
+    (d / _CURR).write_text("stale content", encoding="utf-8")
+    (d / _MARKER).write_text("2026-10-19", encoding="ascii")
+    assert rotate_if_stale(d, today=__import__("datetime").date(2026, 10, 20)) is True
+    assert (d / _ARCHIVE.format("20261019_2")).read_text(encoding="utf-8") == "stale content"
+    assert (d / _MARKER).read_text(encoding="ascii") == "2026-10-20"
+    log_event("D", "after_rotate")            # 轮转后首写不崩
+    assert (d / _CURR).exists()
