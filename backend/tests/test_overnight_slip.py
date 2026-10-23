@@ -115,3 +115,28 @@ def test_backtest_longvol_reference_never_slipped():
     a = backtest(df, pct, ana)["longvol"]
     b = backtest(df, pct, ana, open_map=om, iv_beta=0.9)["longvol"]
     assert a == b
+
+
+# ---------- fetch_open_map 失败契约：失败返 None，绝不抛出（fail-closed 上游） ----------
+
+def test_fetch_open_map_returns_none_on_network_failure(monkeypatch):
+    import sys as _sys
+    m2 = _sys.modules.get("m2_run")
+    assert m2 is not None, "项目根未入 sys.path"
+    import types
+
+    class _Boom:
+        def __getattr__(self, name):
+            raise ConnectionError("代理不可达")
+
+    monkeypatch.setitem(_sys.modules, "akshare", _Boom())
+    assert m2.fetch_open_map(days=30) is None
+
+
+def test_fetch_open_map_none_propagates_to_backtest_failopen():
+    """open_map=None → 滑点自动关闭（fail-open 留痕），与缺数据路径同分支。"""
+    df = _df(n=80, seed=11)
+    pct, ana = _states(df)
+    stats = {}
+    backtest(df, pct, ana, open_map=None, iv_beta=0.5, stats_out=stats)
+    assert stats["slip_applied_n"] == 0 and stats["switch_n"] == 1
