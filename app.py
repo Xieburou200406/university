@@ -145,11 +145,22 @@ def _curve_meta():
     return d, px, exp_str, T, F, fn, r2, model, near
 
 
+@st.cache_data(ttl=86400, show_spinner="拉取 ETF 开盘价（隔夜滑点口径，M8-①）...")
+def _open_map_cached():
+    from m2_run import fetch_open_map
+    return fetch_open_map(days=600)
+
+
 @st.cache_data(ttl=600, show_spinner="回测计算 ...")
 def run_backtest(v, df):
+    from m3_run import estimate_iv_beta
     pct_states = percentile_states(df["iv_near"].tolist())
     ana_states = analog_states(df)
-    return pct_states, ana_states, backtest(df, pct_states, ana_states)
+    beta = estimate_iv_beta(df)
+    om = _open_map_cached()
+    stats = {}
+    curves = backtest(df, pct_states, ana_states, open_map=om, iv_beta=beta, stats_out=stats)
+    return pct_states, ana_states, curves, stats
 
 
 def max_drawdown(nav):
@@ -190,6 +201,18 @@ def _iv_degrade_state() -> bool:
 
 if _iv_degrade_state():
     st.sidebar.error("⚠️ IV 连续两日跳变（>30 分位）——信号链降级中，结论仅作参考")
+
+# ---- M8-② 声明页（§交付打磨：只输出建议 / T+1 有效 / 统计非保证） ----
+with st.sidebar.expander("📜 声明（必读）", expanded=False):
+    st.markdown(
+        "**1. 只输出建议，绝不自动下单。** 本系统不构成投资建议，不承诺任何收益；"
+        "据此操作，风险自担。\n\n"
+        "**2. 信号 T+1 有效。** T 日收盘产生的信号只在下一交易日有效，过期自动作废"
+        "（建议卡有有效期倒计时）；执行前必须用 T+1 最新行情复核。\n\n"
+        "**3. 类比引擎是统计规律，不是保证。** 历史相似情景的方向命中率是概率优势，"
+        "存在失效可能；周度复核连续跌破基准时面板会亮黄色警告——看到警告请降低信任。\n\n"
+        "**4. 回测与模拟均偏乐观。** 回测为 IV 点代理口径（含换向成本与隔夜滑点估计），"
+        "模拟盘成交假设无排队无部分成交；**模拟/回测盈利不构成实盘盈利预期**。")
 
 
 st.sidebar.caption("铁律：只输出建议，永不自动下单；\n信号 T 日生成、T+1 执行窗口内有效。")
@@ -260,7 +283,7 @@ with tab1:
 with tab2:
     eng = PercentileEngine(window=WINDOW)
     sig = eng.run(df["iv_near"].tolist())
-    pct_states, ana_states, _ = run_backtest(v, df)
+    pct_states, ana_states, _, _ = run_backtest(v, df)
 
     # ---- §18.6 今日建议（滞留-采纳闭环）：T 收盘生成 → T+1 呈现 → 挂到采纳/忽略/过期 ----
     try:
@@ -576,8 +599,8 @@ with tab4:
 # ---------- Tab5 回测 ----------
 
 with tab5:
-    st.subheader("双引擎回测（IV 点代理 + 换向成本 30 元/次）")
-    pct_states, ana_states, curves = run_backtest(v, df)
+    st.subheader("双引擎回测（IV 点代理 + 换向成本 + 隔夜滑点）")
+    pct_states, ana_states, curves, _bt = run_backtest(v, df)
     fig = go.Figure()
     names = {"percentile": "分位数引擎", "analog": "类比引擎", "longvol": "买入持有长波(参照)"}
     colors = {"percentile": "#185FA5", "analog": "#0F6E56", "longvol": "#888780"}
@@ -593,6 +616,12 @@ with tab5:
         rows.append({"策略": names[k], "累计盈亏": f"{nav[-1]:+.0f}",
                      "最大回撤": f"{max_drawdown(nav):.0f}"})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    if _bt.get("slip_applied_n"):
+        st.caption(f"隔夜滑点（M8-①）：换仓 {_bt['switch_n']} 次、修正 {_bt['slip_applied_n']} 次"
+                   f"（缺开盘价 {_bt['slip_missing_n']} 次），累计滑点 {_bt['total_slip_pnl']:+.0f} 元，"
+                   f"β(ΔIV~标的日收益)={_bt['iv_beta']:.2f}——换仓执行按 T+1 开盘价口径，隔夜段不归属策略。")
+    else:
+        st.caption("隔夜滑点未应用（开盘价数据/β 不足）——本图仍为收盘代理口径，正式口径以 m3_report 为准。")
     st.caption("可交易日约 " + str(len(df) - WINDOW) + " 个，仅覆盖单一 regime；结论待样本 ≥1 年后再下。")
 
 # ---------- Tab6 模拟盘（§12，M6） ----------

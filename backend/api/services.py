@@ -648,16 +648,10 @@ def _open_theta_annual(session: Session) -> float:
 
 
 def _fetch_open_map(days: int = 30) -> dict | None:
-    """T+1 开盘价映射（§13 标签/晨检复核）。联网失败返回 None → 预测自然弃权（fail-closed）。"""
-    try:
-        import akshare as ak
-        hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
-                                   start_date="20240101", end_date="20991231", adjust="")
-        hist["日期"] = hist["日期"].astype(str).str[:10]
-        tail = hist.tail(days)
-        return dict(zip(tail["日期"], tail["开盘"].astype(float)))
-    except Exception:
-        return None
+    """T+1 开盘价映射（§13 标签/晨检复核）。委托 m2_run.fetch_open_map（M8-① 起单一来源）。
+    联网失败返回 None → 预测自然弃权（fail-closed）。"""
+    from m2_run import fetch_open_map
+    return fetch_open_map(days)
 
 
 def trigger_pipeline(session: Session, fetch_df=None) -> PipelineRun:

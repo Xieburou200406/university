@@ -28,6 +28,7 @@ FORMAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"
 UNIT = 10000
 VEGA_NOTIONAL = 100.0        # 回测代理：每 1 个 IV 点（0.01）盈亏 100 元
 SWITCH_COST = 30.0           # 每次换向成本 ≈ 0.3 个 IV 点（价差+手续费代理）
+IV_BETA_MIN_SAMPLES = 60     # ΔIV~标的收益回归最少样本；不足 → beta=0（隔夜修正自动关闭）
 HOLD_DAYS = 20               # 归因演示：持仓 20 个交易日
 
 
@@ -286,17 +287,45 @@ def _sync_formal_ledger(d_open, K, exp_str, rows_ledger, df, open_px):
 
 # ---------- 回测 ----------
 
-def backtest(df, pct_states, ana_states):
+def estimate_iv_beta(df) -> float:
+    """ΔIV 对 ETF 日收益的 OLS 斜率（隔夜跳空对 IV 的传导系数，M8-①）。
+    数据驱动不拍脑袋：样本 < IV_BETA_MIN_SAMPLES 或零方差 → 0.0（等价关闭隔夜修正）。"""
+    r = np.asarray(df["spot"], dtype=float)
+    iv = np.asarray(df["iv_near"], dtype=float)
+    if len(r) < 2:
+        return 0.0
+    ret = r[1:] / r[:-1] - 1.0
+    div = iv[1:] - iv[:-1]
+    ok = ~(np.isnan(ret) | np.isnan(div) | (r[:-1] <= 0))
+    if int(ok.sum()) < IV_BETA_MIN_SAMPLES:
+        return 0.0
+    x, y = ret[ok], div[ok]
+    vx = float(x.var())
+    if vx <= 0:
+        return 0.0
+    return float(((x - x.mean()) * (y - y.mean())).mean() / vx)
+
+
+def backtest(df, pct_states, ana_states, open_map=None, iv_beta=None, stats_out=None):
     """
     口径修正版回测：
     - 状态滞后 1 日生效（T 日收盘出状态，T+1 才建仓赚 T+1 的涨跌），消灭日内前视；
     - 类比引擎按预测持有期平滑：暴露 = 过去 HORIZON 日状态之和的符号，
       避免预测未到期就被每日翻转（这正是方向命中率高却亏损的根源）。
+    - M8-① 隔夜滑点：换仓执行发生在 T+1 开盘——现有模型把 T 收盘→T+1 收盘整段
+      IV 变动记为盈利，但 T 收盘→T+1 开盘的隔夜段在成交前不归属策略。用标的开盘价
+      跳空 gap = open(T+1)/close(T) − 1 与传导系数 beta(ΔIV~标的日收益) 代理隔夜 IV
+      变动，换仓日修正 pnl -= e·beta·gap·名义（对称修正，跳空有利时也是正贡献）。
+      open_map=None（缺数据）或 beta=0 → 修正自动关闭（stats 留痕，绝不虚构）。
     """
     iv = df["iv_near"].tolist()
+    dates = df["date"].tolist()
+    spots = np.asarray(df["spot"], dtype=float)
     n = len(iv)
     curves = {"percentile": [0.0], "analog": [0.0], "longvol": [0.0]}
     prev_exp = {"percentile": 0, "analog": 0}
+    stats = {"iv_beta": float(iv_beta or 0.0), "switch_n": 0, "slip_applied_n": 0,
+             "slip_missing_n": 0, "total_slip_pnl": 0.0}
     for i in range(1, n):
         div = (iv[i] - iv[i - 1]) / 0.01   # IV 点
         # 分位数：昨日状态（消灭前视）
@@ -311,9 +340,22 @@ def backtest(df, pct_states, ana_states):
             pnl = e * div * VEGA_NOTIONAL
             if e != prev_e:
                 pnl -= SWITCH_COST
+                stats["switch_n"] += 1
+                if open_map and iv_beta and e != 0:
+                    opx = open_map.get(str(dates[i]))
+                    if opx and opx > 0 and spots[i - 1] > 0:
+                        gap = opx / spots[i - 1] - 1.0
+                        slip = e * iv_beta * gap * VEGA_NOTIONAL
+                        pnl -= slip
+                        stats["slip_applied_n"] += 1
+                        stats["total_slip_pnl"] += slip
+                    else:
+                        stats["slip_missing_n"] += 1
             curves[name].append(curves[name][-1] + pnl)
         prev_exp["percentile"], prev_exp["analog"] = e_pct, e_ana
         curves["longvol"].append(curves["longvol"][-1] + div * VEGA_NOTIONAL)
+    if stats_out is not None:
+        stats_out.update(stats)
     return curves
 
 
@@ -337,8 +379,20 @@ def main():
     ana_states = analog_states(df)
     log("信号回放完成")
 
-    # 回测
-    curves = backtest(df, pct_states, ana_states)
+    # 回测（M8-①：隔夜滑点——开盘价映射联网拉取，失败 fail-open 关闭修正并留痕）
+    from m2_run import fetch_open_map
+    open_map = fetch_open_map(days=len(df) + 60)
+    iv_beta = estimate_iv_beta(df)
+    bt_stats = {}
+    curves = backtest(df, pct_states, ana_states, open_map=open_map,
+                      iv_beta=iv_beta, stats_out=bt_stats)
+    if open_map and iv_beta:
+        log(f"隔夜滑点：β(ΔIV~标的日收益)={iv_beta:.2f}，换仓 {bt_stats['switch_n']} 次、"
+            f"修正 {bt_stats['slip_applied_n']} 次（缺开盘价 {bt_stats['slip_missing_n']} 次）、"
+            f"累计滑点 {bt_stats['total_slip_pnl']:+.0f} 元")
+    else:
+        log(f"隔夜滑点：未应用（open_map={'有' if open_map else '缺失'}, "
+            f"beta={iv_beta:.2f}）——回测仍为收盘代理口径")
 
     # 持仓归因
     d_open, K, exp_str, ledger, attr = replay_position(panel, df)
@@ -366,7 +420,11 @@ def build_report(ctx):
     for k in curves:
         fig_nav.add_trace(go.Scatter(x=df["date"], y=curves[k], mode="lines",
                                      name=names[k], line=dict(color=colors[k], width=2)))
-    fig_nav.update_layout(title="回测净值（IV 点代理收益，含换手成本）",
+    bt = ctx.get("bt_stats") or {}
+    _slip = (f"；隔夜滑点修正 {bt['slip_applied_n']} 次 / {bt['switch_n']} 次换仓，"
+             f"累计 {bt['total_slip_pnl']:+.0f} 元，β={bt['iv_beta']:.2f}"
+             if bt.get("slip_applied_n") else "；隔夜滑点未应用（开盘价/β 数据缺失，收盘代理口径）")
+    fig_nav.update_layout(title=f"回测净值（IV 点代理收益，含换手成本{_slip}）",
                           xaxis_title="日期", yaxis_title="累计盈亏（元，代理）",
                           template="plotly_white", height=420)
 

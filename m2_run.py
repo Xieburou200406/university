@@ -98,6 +98,21 @@ def expiry_from_code(code):
         return pd.NaT
 
 
+def fetch_open_map(days: int = 520) -> "dict | None":
+    """510050 ETF 开盘价映射（YYYY-MM-DD → 元）。
+    消费方：§4.5 回测隔夜滑点（M8-①）与 §13 隔夜预测标签。联网失败返回 None，
+    由调用方按各自语义降级（回测 fail-open 跳过修正 / 预测 fail-closed 弃权）。"""
+    try:
+        import akshare as ak
+        hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
+                                   start_date="20240101", end_date="20991231", adjust="")
+        hist["日期"] = hist["日期"].astype(str).str[:10]
+        tail = hist.tail(days)
+        return dict(zip(tail["日期"], tail["开盘"].astype(float)))
+    except Exception:
+        return None
+
+
 def build_daily_history(contracts=None):
     """逐日（并行+缓存）：当日近月ATM IV、次月ATM IV、25Δ偏斜。"""
     days = fetch_dates(M2_DAYS)
