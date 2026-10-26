@@ -129,6 +129,9 @@ def test_fetch_open_map_returns_none_on_network_failure(monkeypatch):
         def __getattr__(self, name):
             raise ConnectionError("代理不可达")
 
+    # fetch_open_map 双源：主源 requests(新浪) + 备源 akshare(东财)，全部失败才返 None；
+    # 测试双双屏蔽保证离线确定性（绝不触网）。
+    monkeypatch.setitem(_sys.modules, "requests", _Boom())
     monkeypatch.setitem(_sys.modules, "akshare", _Boom())
     assert m2.fetch_open_map(days=30) is None
 
@@ -140,3 +143,31 @@ def test_fetch_open_map_none_propagates_to_backtest_failopen():
     stats = {}
     backtest(df, pct, ana, open_map=None, iv_beta=0.5, stats_out=stats)
     assert stats["slip_applied_n"] == 0 and stats["switch_n"] == 1
+
+
+def test_fetch_open_map_sina_primary_parses(monkeypatch):
+    """主源新浪 JSONP 解析：伪造响应 → 正确还原 {day: open}，绝不触网。"""
+    import sys as _sys
+    m2 = _sys.modules.get("m2_run")
+    assert m2 is not None
+    import json as _json
+
+    payload = [{"day": "2026-01-05", "open": "2.800", "close": "2.812"},
+               {"day": "2026-01-06", "open": "2.815", "close": "2.800"},
+               {"day": "2026-01-07", "open": "", "close": "2.790"}]  # 空 open 应被剔除
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        @property
+        def text(self):
+            return "var _=(" + _json.dumps(payload) + ");"
+
+    class _FakeRequests:
+        def get(self, url, **kw):
+            return _FakeResp()
+
+    monkeypatch.setitem(_sys.modules, "requests", _FakeRequests())
+    om = m2.fetch_open_map(days=30)
+    assert om == {"2026-01-05": 2.800, "2026-01-06": 2.815}

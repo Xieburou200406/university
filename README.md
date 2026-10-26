@@ -91,3 +91,16 @@ vol-demo/
 - `docs/详细设计-后端与前端.md` — 架构、DB、API、前端、调度、执行建议、模拟盘、隔夜预测、风险预算、UX 与系统设计修订、日志运维升级、交易所规则载入引擎、建议生命周期、行业常情审计（§1-§20）
 - `docs/参考学习-QS知识库.md` — QS 参考知识库的学习报告：日志管理（明细/聚合两级、快照差分、排查 runbook、daily/curr 轮转）、交易所规则载入（规则库+交易日历，已落地 backend/vol/calendar）、其他工程规范（公式三件套、金样本、形状恒等式校验）
 - `波动率决策辅助系统-架构设计与Agent文档.md` — 早期架构文档
+
+## 单机版打包（M8-③）
+
+免安装交付：`release/VolDemo/VolDemo.exe`（onedir，约 286MB）。
+
+- **启动**：双击 `VolDemo.exe` → 自动开浏览器 `http://localhost:8501`
+  （命令行可传 streamlit 参数；`VOLDEMO_PORT` 换端口、`VOLDEMO_NO_BROWSER=1` 不自动开浏览器）
+- **数据落点**：数据库/IV 缓存/日志全部写在 **exe 旁边**（`data/`、`vol_demo.db`、`logs/`），
+  换目录部署不丢账本；首次启动自动建库
+- **重建**：`pyinstaller vol_demo.spec --noconfirm`（入口 `launch.py`，onedir；streamlit/plotly
+  整包收集 + dist-info 元数据显式打包——`importlib.metadata` 读版本需要）
+- 打包环境的三个必踩坑（已内置处理）：dist-info 元数据缺失、`sys.argv` 未传给 streamlit CLI、
+  `global.developmentMode` 必须显式为 false

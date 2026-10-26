@@ -23,8 +23,11 @@ from vol.signals import AnalogEngine
 from run_demo import R_FREE, log
 from m2_run import CACHE_DIR, WINDOW, HORIZON, fetch_dates, expiry_from_code
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vol_demo.db")
-FORMAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vol.db")
+# 运行根：与 m2_run.ROOT 同口径（frozen → exe 目录，开发 → 项目根）
+from m2_run import ROOT  # noqa: E402  (m2_run 在上方已把 backend 与自身目录入 path)
+
+DB_PATH = os.path.join(ROOT, "vol_demo.db")
+FORMAL_DB_PATH = os.path.join(ROOT, "data", "vol.db")
 UNIT = 10000
 VEGA_NOTIONAL = 100.0        # 回测代理：每 1 个 IV 点（0.01）盈亏 100 元
 SWITCH_COST = 30.0           # 每次换向成本 ≈ 0.3 个 IV 点（价差+手续费代理）

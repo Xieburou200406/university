@@ -6,3 +6,9 @@ vol_demo.db
 backend/static/
 data/vol.db*
 backend/db/migrations/__pycache__/
+build/
+build2/
+dist/
+release/
+release2/
+*.spec.bak

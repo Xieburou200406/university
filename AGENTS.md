@@ -211,7 +211,7 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 ### M8 交付打磨
 - [x] 回测加隔夜滑点模型（M8-①：换仓日按 T+1 开盘口径——gap=ETF开盘/前收−1 × β(ΔIV~标的日收益) 数据驱动传导，对称修正；缺开盘价/β样本<60 自动关闭并留痕；8 测试）。
 - [x] 面板加"声明页"（M8-②：侧边栏 📜 声明 expander——只输出建议/T+1 有效/统计非保证/回测模拟偏乐观，四条必读）。
-- [ ] 打包：PyInstaller 单机版或 Docker；可选发布为在线链接（WorkBuddy sites）。
+- [x] 打包（M8-③：PyInstaller onedir——`vol_demo.spec` + `launch.py` 入口，286MB 免安装单机版 `release/VolDemo/VolDemo.exe` 双击即用、自动开浏览器；frozen 时 db/缓存/日志落 exe 旁；冒烟 HTTP 200 + health ok）。
 - [ ] 历史扩到全量（2015 年起），复核类比引擎在 2020/2024 极端行情的表现并写进报告。
 
 **验收标准（每条里程碑通用的 Done 定义）**：三份报告重新生成且关键数字无意外漂移；新增纯函数有单测且通过；AppTest 冒烟 0 异常；报告/面板上的数字能对上数据库原始行；已 commit + push 到 GitHub。

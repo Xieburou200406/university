@@ -16,6 +16,7 @@
 环境变量 OPSLOG_DIR 可重定向日志根目录（测试隔离用）。
 """
 import os
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -30,7 +31,11 @@ def _log_dir(log_dir) -> Path:
         p = Path(log_dir)
     else:
         env = os.environ.get("OPSLOG_DIR")
-        p = Path(env) if env else Path(__file__).resolve().parents[2] / "logs"
+        # 运行根：frozen（PyInstaller）→ exe 目录，开发 → 仓库根
+        root = (Path(sys.executable).resolve().parent
+                if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parents[2])
+        p = Path(env) if env else root / "logs"
     p.mkdir(parents=True, exist_ok=True)
     return p
 

@@ -20,6 +20,11 @@ import pandas as pd
 import akshare as ak
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
+
+# 运行根：打包（PyInstaller frozen）时持久化到 exe 旁边，开发时为项目根
+ROOT = (os.path.dirname(os.path.abspath(sys.executable))
+        if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__)))
 from vol.pricing.curve import fit_curve_iv
 from vol.contracts import expiry_from_code as _expiry_from_ym, filter_exrights
 from vol.signals import PercentileEngine, AnalogEngine, build_features
@@ -27,7 +32,7 @@ from run_demo import (UNDERLYING, UNIT, R_FREE, HIST_DAYS, parse_symbol,
                       step1_underlying_and_contracts, step2_risk_indicator,
                       step3_live_quotes, log)
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+CACHE_DIR = os.path.join(ROOT, "data", "cache")
 M2_DAYS = 520          # ≈ 2 年交易日，重新验证类比引擎（v2 缓存增量补拉）
 WINDOW = 120
 HORIZON = 10
@@ -101,7 +106,28 @@ def expiry_from_code(code):
 def fetch_open_map(days: int = 520) -> "dict | None":
     """510050 ETF 开盘价映射（YYYY-MM-DD → 元）。
     消费方：§4.5 回测隔夜滑点（M8-①）与 §13 隔夜预测标签。联网失败返回 None，
-    由调用方按各自语义降级（回测 fail-open 跳过修正 / 预测 fail-closed 弃权）。"""
+    由调用方按各自语义降级（回测 fail-open 跳过修正 / 预测 fail-closed 弃权）。
+    主源新浪 K 线 JSON（国内直连稳定），备源东财 akshare（部分网络环境拒连）。"""
+    # 主源：新浪 CN_MarketDataService（scale=240 即日线；datalen 上限约 1023）
+    try:
+        import requests
+        ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0",
+              "Referer": "https://finance.sina.com.cn"}
+        url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/var _=/CN_MarketDataService"
+               f".getKLineData?symbol=sh510050&scale=240&ma=no&datalen={min(days, 1023)}")
+        r = requests.get(url, headers=ua, timeout=10)
+        r.raise_for_status()
+        txt = r.text
+        i, j = txt.find("["), txt.rfind("]")
+        if i < 0 or j <= i:
+            raise ValueError("sina kline: 未找到 JSON 数组")
+        rows = json.loads(txt[i:j + 1])
+        om = {row["day"]: float(row["open"]) for row in rows if row.get("open")}
+        if om:
+            return om
+    except Exception:
+        pass
+    # 备源：东财 akshare（不可达时静默降级）
     try:
         import akshare as ak
         hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
