@@ -131,7 +131,7 @@ def fetch_open_map(days: int = 520) -> "dict | None":
     try:
         import akshare as ak
         hist = ak.fund_etf_hist_em(symbol="510050", period="daily",
-                                   start_date="20240101", end_date="20991231", adjust="")
+                                   start_date="20150201", end_date="20991231", adjust="")
         hist["日期"] = hist["日期"].astype(str).str[:10]
         tail = hist.tail(days)
         return dict(zip(tail["日期"], tail["开盘"].astype(float)))
