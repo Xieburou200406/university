@@ -106,6 +106,8 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         asof = session.execute(select(func.max(PositionSnapshot.date))).scalar_one()
     if asof is None:
         return {"asof": None, "rows": [], "total_margin_est": 0.0,
+                "portfolio_margin": {"standalone": 0.0, "relief": 0.0,
+                                     "covered_contracts": 0, "pairs": []},
                 "max_loss_level": None, "expiry_week": [], "price_limit_hits": []}
 
     snaps = {s.position_id: s for s in session.execute(
@@ -114,12 +116,14 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         select(Position).where(func.upper(Position.status) == "OPEN")).scalars().all()
 
     rows: list[dict] = []
+    legs: list[tuple] = []          # 组合保证金入参：(code, qty, cur_px, spot)
     for p in positions:
         s = snaps.get(p.id)
         if s is None:
             continue
         qty = int(p.qty)
         cur_px = abs(s.mv) / (abs(qty) * pr.UNIT) if qty else 0.0
+        legs.append((p.code, qty, cur_px, s.spot))
         ratio, level = pr.loss_level(s.mv, qty, p.open_px)
         margin = pr.estimate_margin_short(cur_px, s.spot) * abs(qty) if qty < 0 else 0.0
         exp = pr.parse_expiry(p.code)
@@ -148,9 +152,15 @@ def position_risk_review(session: Session, asof: date | None = None) -> dict:
         })
 
     levels = [r["loss_level"] for r in rows if r["loss_level"]]
+    # 组合保证金：买腿覆盖卖腿的价差组合按行权价差计收（不可解析码 fail-soft 不抵扣）
+    pm = pr.estimate_portfolio_margin(legs)
     return {
         "asof": str(asof), "rows": rows,
-        "total_margin_est": round(sum(r["margin_est"] for r in rows), 2),
+        "total_margin_est": pm["total"],
+        "portfolio_margin": {"standalone": pm["standalone_total"],
+                             "relief": pm["relief"],
+                             "covered_contracts": pm["covered_contracts"],
+                             "pairs": pm["pairs"]},
         "max_loss_level": "STRONG" if "STRONG" in levels else ("WARN" if "WARN" in levels else None),
         "expiry_week": [r["code"] for r in rows if r["expiry_week"]],
         "price_limit_hits": [f"{r['code']}({r['price_limit_hit']})" for r in rows if r["price_limit_hit"]],
@@ -270,13 +280,16 @@ def generate_advice(session: Session, settings: Settings, signal_id: int) -> Adv
                                f"深虚/深实持仓（只平不开）：{'、'.join(deep_list[:5])}"
                                + (f" 等 {len(deep_list)} 个" if len(deep_list) > 5 else "")))})
 
-    # ⑧ 资金占用（CapitalUsageRule）：保证金占用估算 / 基准资金
+    # ⑧ 资金占用（CapitalUsageRule）：组合保证金估算 / 基准资金（买腿覆盖卖腿已抵扣）
     margin_total = float(review.get("total_margin_est") or 0.0)
+    pm_info = review.get("portfolio_margin") or {}
+    relief = float(pm_info.get("relief") or 0.0)
     usage = margin_total / settings.capital_base if settings.capital_base > 0 else 0.0
     capital_ok = usage <= settings.capital_usage_limit
     checks.append({"name": "capital_usage", "passed": capital_ok,
-                   "detail": (f"保证金占用估算 {margin_total:.0f} 元 / 基准资金 {settings.capital_base:.0f} 元"
-                              f" = {usage:.1%}（上限 {settings.capital_usage_limit:.0%}）")})
+                   "detail": (f"组合保证金估算 {margin_total:.0f} 元 / 基准资金 {settings.capital_base:.0f} 元"
+                              f" = {usage:.1%}（上限 {settings.capital_usage_limit:.0%}）"
+                              + (f"；买腿覆盖抵扣 {relief:.0f} 元（{pm_info.get('covered_contracts', 0)} 张）" if relief > 0 else ""))})
 
     # ⑨ 流动性门（LiquidityGateRule）：OPEN 持仓实时盘口 → 0-100 分（价差 60% + 量分位 40%）
     liq_codes: list[str] = []

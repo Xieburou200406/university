@@ -142,6 +142,8 @@ def test_review_empty_ledger(session):
     from api.services import position_risk_review
     rv = position_risk_review(session)
     assert rv == {"asof": None, "rows": [], "total_margin_est": 0.0,
+                  "portfolio_margin": {"standalone": 0.0, "relief": 0.0,
+                                       "covered_contracts": 0, "pairs": []},
                   "max_loss_level": None, "expiry_week": [], "price_limit_hits": []}
 
 

@@ -216,6 +216,10 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 
 **验收标准（每条里程碑通用的 Done 定义）**：三份报告重新生成且关键数字无意外漂移；新增纯函数有单测且通过；AppTest 冒烟 0 异常；报告/面板上的数字能对上数据库原始行；已 commit + push 到 GitHub。
 
+### M9 backlog（正式版后续）
+- [x] 组合保证金（2026-11-13）：`vol.position_risk.estimate_portfolio_margin`——同 (cp, 到期日) 内买腿覆盖卖腿（Call 买≤卖 / Put 买≥卖），覆盖腿按行权价差×合约单位计收（min 抵扣上限=原上界），未覆盖维持单腿上界；一张长腿只覆盖一张卖腿；不可解析码 fail-soft 不抵扣。接入 `position_risk_review`（返回新增 `portfolio_margin` 明细）与 CapitalUsageRule（⑧ detail 含抵扣额）。10 新测试，全量 169 passed；真实库端到端核对通过（空账本 0/0）。
+- [ ] 除权行权价修正表：分红除权日行权价修正映射表（原合约代码数字已失真，见 §20 P3-7 注释）。
+
 ---
 
 ## 9. 可直接粘贴的 Agent 主提示词
